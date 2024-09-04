@@ -37,7 +37,7 @@ use crate::{
         page::{
             self,
             meta::{PageMeta, PageTablePageMeta, PageUsage},
-            DynPage, Page,
+            AnyPage, Page,
         },
         page_prop::PageProperty,
         Paddr, PagingConstsTrait, PagingLevel, PAGE_SIZE,
@@ -209,7 +209,7 @@ where
     [(); C::NR_LEVELS as usize]:,
 {
     PageTable(RawPageTableNode<E, C>),
-    Page(DynPage, PageProperty),
+    Page(AnyPage, PageProperty),
     /// Pages not tracked by handles.
     Untracked(Paddr, PageProperty),
     None,
@@ -298,11 +298,11 @@ where
                 // SAFETY: We have a reference count to the page and can safely
                 // increase the reference count by one more.
                 unsafe {
-                    DynPage::inc_ref_count(paddr);
+                    AnyPage::inc_ref_count(paddr);
                 }
                 // SAFETY: The physical address of the PTE points to a forgotten
                 // page. It is reclaimed only once.
-                Child::Page(unsafe { DynPage::from_raw(paddr) }, pte.prop())
+                Child::Page(unsafe { AnyPage::from_raw(paddr) }, pte.prop())
             } else {
                 Child::Untracked(paddr, pte.prop())
             }
@@ -362,7 +362,7 @@ where
             } else if in_tracked_range {
                 // SAFETY: The physical address of the old PTE points to a
                 // forgotten page. It is reclaimed only once.
-                Child::Page(unsafe { DynPage::from_raw(paddr) }, old_pte.prop())
+                Child::Page(unsafe { AnyPage::from_raw(paddr) }, old_pte.prop())
             } else {
                 Child::Untracked(paddr, old_pte.prop())
             }
@@ -558,7 +558,7 @@ where
                     // untracked pages. This must be verified.
                     // SAFETY: The physical address must be casted from a handle to a
                     // page.
-                    drop(unsafe { DynPage::from_raw(pte.paddr()) });
+                    drop(unsafe { AnyPage::from_raw(pte.paddr()) });
                 }
             }
         }
