@@ -18,11 +18,12 @@ use crate::prelude::*;
 
 mod dyn_cap;
 mod options;
-mod pager;
+//mod pager;
 mod static_cap;
 
 pub use options::{VmoChildOptions, VmoOptions};
-pub use pager::Pager;
+//pub use pager::Pager;
+pub use crate::fs::pagecache::PageCacheManager;
 
 use self::options::ChildType;
 
@@ -186,9 +187,9 @@ impl Pages {
 /// Broadly speaking, there are two types of VMO:
 /// 1. File-backed VMO: the VMO backed by a file and resides in the `PageCache`,
 ///    which includes a pager to provide it with actual pages.
-/// 2. Anonymous VMO: the VMO without a file backup, which does not have a pager.
+/// (Deprecated) 2. Anonymous VMO: the VMO without a file backup, which does not have a pager.
 pub(super) struct Vmo_ {
-    pager: Option<Arc<dyn Pager>>,
+    pager: Option<Arc<PageCacheManager>>,
     /// Flags
     flags: VmoFlags,
     /// The offset of the range of pages corresponding to the VMO within `pages`.
@@ -248,7 +249,10 @@ impl Vmo_ {
                 (FrameAllocOptions::new(1).alloc_single()?, is_cow_vmo)
             }
             Some(pager) => {
-                let page = pager.commit_page(page_idx)?;
+                //TODO: add reverse_map for page@dxy.
+                let pagecache_page = pager.commit_page(page_idx)?;
+                pagecache_page.reverse_map = self;
+                let page = pagecache_page.frame;
                 // The prerequisite for triggering the COW mechanism here is that the current
                 // VMO requires COW and the prepared page is about to undergo a write operation.
                 // At this point, the `Frame` obtained from the pager needs to be cloned to
@@ -407,6 +411,7 @@ impl Vmo_ {
             read_offset = 0;
         };
 
+        // TODO: add lru_promotion@dxy.
         self.commit_and_operate(&read_range, read, CommitFlags::empty())
     }
 
@@ -451,6 +456,8 @@ impl Vmo_ {
                 ..(raw_page_idx_range.end + self.page_idx_offset);
             for page_idx in page_idx_range {
                 pager.update_page(page_idx)?;
+                //TODO: modfiy the lru_promotion mechanism to avoid dupicate promotion@dxy.
+                pager.lru_promotion(page_idx)?;
             }
         }
         Ok(())
