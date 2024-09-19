@@ -247,7 +247,7 @@ impl VmMapping {
                 if self.is_shared || only_reference {
                     cursor.protect(PAGE_SIZE, |p| p.flags |= new_flags);
                 } else {
-                    let new_frame = FrameAllocOptions::new(1).uninit(true).alloc_single(())?;
+                    let new_frame = FrameAllocOptions::new().zero_init(false).alloc_single(())?;
                     new_frame.writer().write(&mut frame.reader());
                     prop.flags |= new_flags;
                     cursor.map(new_frame.into(), prop);
@@ -293,7 +293,7 @@ impl VmMapping {
         let mut is_readonly = false;
         let Some(vmo) = &self.vmo else {
             return Ok((
-                FrameAllocOptions::new(1).alloc_single(())?.into(),
+                FrameAllocOptions::new().alloc_single(())?.into(),
                 is_readonly,
             ));
         };
@@ -304,7 +304,7 @@ impl VmMapping {
             if !self.is_shared {
                 // The page index is outside the VMO. This is only allowed in private mapping.
                 return Ok((
-                    FrameAllocOptions::new(1).alloc_single(())?.into(),
+                    FrameAllocOptions::new().alloc_single(())?.into(),
                     is_readonly,
                 ));
             } else {
@@ -319,7 +319,7 @@ impl VmMapping {
             // Write access to private VMO-backed mapping. Performs COW directly.
             Ok((
                 {
-                    let new_frame = FrameAllocOptions::new(1).alloc_single(())?;
+                    let new_frame = FrameAllocOptions::new().alloc_single(())?;
                     new_frame.writer().write(&mut page.reader());
                     new_frame.into()
                 },
