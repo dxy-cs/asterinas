@@ -8,9 +8,12 @@ use alloc::{boxed::Box, fmt::Debug, sync::Arc, vec::Vec};
 
 use id_alloc::IdAlloc;
 use spin::Once;
-use trapframe::TrapFrame;
+use x86_64::registers::rflags::{self, RFlags};
 
-use crate::sync::{Mutex, SpinLock, SpinLockGuard};
+use crate::{
+    sync::{Mutex, PreemptDisabled, SpinLock, SpinLockGuard},
+    trap::TrapFrame,
+};
 
 /// The global allocator for software defined IRQ lines.
 pub(crate) static IRQ_ALLOCATOR: Once<SpinLock<IdAlloc>> = Once::new();
@@ -53,7 +56,7 @@ pub(crate) fn disable_local() {
 }
 
 pub(crate) fn is_local_enabled() -> bool {
-    x86_64::instructions::interrupts::are_enabled()
+    (rflags::read_raw() & RFlags::INTERRUPT_FLAG.bits()) != 0
 }
 
 static CALLBACK_ID_ALLOCATOR: Once<Mutex<IdAlloc>> = Once::new();
@@ -101,7 +104,9 @@ impl IrqLine {
         self.irq_num
     }
 
-    pub fn callback_list(&self) -> SpinLockGuard<alloc::vec::Vec<CallbackElement>> {
+    pub fn callback_list(
+        &self,
+    ) -> SpinLockGuard<alloc::vec::Vec<CallbackElement>, PreemptDisabled> {
         self.callback_list.lock()
     }
 
@@ -149,4 +154,28 @@ impl Drop for IrqCallbackHandle {
         a.retain(|item| item.id != self.id);
         CALLBACK_ID_ALLOCATOR.get().unwrap().lock().free(self.id);
     }
+}
+
+/// Sends a general inter-processor interrupt (IPI) to the specified CPU.
+///
+/// # Safety
+///
+/// The caller must ensure that the CPU ID and the interrupt number corresponds
+/// to a safe function to call.
+pub(crate) unsafe fn send_ipi(cpu_id: u32, irq_num: u8) {
+    use crate::arch::kernel::apic::{self, Icr};
+
+    let icr = Icr::new(
+        apic::ApicId::from(cpu_id),
+        apic::DestinationShorthand::NoShorthand,
+        apic::TriggerMode::Edge,
+        apic::Level::Assert,
+        apic::DeliveryStatus::Idle,
+        apic::DestinationMode::Physical,
+        apic::DeliveryMode::Fixed,
+        irq_num,
+    );
+    apic::with_borrow(|apic| {
+        apic.send_ipi(icr);
+    });
 }

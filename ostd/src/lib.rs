@@ -9,13 +9,17 @@
 #![feature(coroutines)]
 #![feature(fn_traits)]
 #![feature(generic_const_exprs)]
+#![feature(is_none_or)]
 #![feature(iter_from_coroutine)]
 #![feature(let_chains)]
+#![feature(min_specialization)]
 #![feature(negative_impls)]
 #![feature(new_uninit)]
 #![feature(panic_info_message)]
 #![feature(ptr_sub_ptr)]
 #![feature(strict_provenance)]
+#![feature(sync_unsafe_cell)]
+#![feature(allocator_api)]
 // The `generic_const_exprs` feature is incomplete however required for the page table
 // const generic implementation. We are using this feature in a conservative manner.
 #![allow(incomplete_features)]
@@ -38,33 +42,43 @@ pub mod logger;
 pub mod mm;
 pub mod panicking;
 pub mod prelude;
+pub mod smp;
 pub mod sync;
 pub mod task;
 pub mod trap;
 pub mod user;
 
+use core::sync::atomic::AtomicBool;
+
 pub use ostd_macros::main;
 pub use ostd_pod::Pod;
 
-pub use self::{cpu::cpu_local::CpuLocal, error::Error, prelude::Result};
+pub use self::{error::Error, prelude::Result};
+// [`CpuLocalCell`] is easy to be misused, so we don't expose it to the users.
+pub(crate) use crate::cpu::local::cpu_local_cell;
 
 /// Initializes OSTD.
 ///
 /// This function represents the first phase booting up the system. It makes
 /// all functionalities of OSTD available after the call.
 ///
-/// TODO: We need to refactor this function to make it more modular and
-/// make inter-initialization-dependencies more clear and reduce usages of
-/// boot stage only global variables.
-pub fn init() {
+/// # Safety
+///
+/// This function should be called only once and only on the BSP.
+//
+// TODO: We need to refactor this function to make it more modular and
+// make inter-initialization-dependencies more clear and reduce usages of
+// boot stage only global variables.
+#[doc(hidden)]
+pub unsafe fn init() {
     arch::enable_cpu_features();
     arch::serial::init();
 
-    #[cfg(feature = "intel_tdx")]
+    #[cfg(feature = "cvm_guest")]
     arch::check_tdx_init();
 
     // SAFETY: This function is called only once and only on the BSP.
-    unsafe { cpu::cpu_local::early_init_bsp_local_base() };
+    unsafe { cpu::local::early_init_bsp_local_base() };
 
     mm::heap_allocator::init();
 
@@ -72,19 +86,29 @@ pub fn init() {
     logger::init();
 
     mm::page::allocator::init();
-    mm::kspace::init_boot_page_table();
     mm::kspace::init_kernel_page_table(mm::init_page_meta());
-    mm::misc_init();
+    mm::dma::init();
 
-    trap::init();
+    // SAFETY: This function is called only once in the entire system.
+    unsafe { trap::softirq::init() };
     arch::init_on_bsp();
+
+    smp::init();
 
     bus::init();
 
-    mm::kspace::activate_kernel_page_table();
+    // SAFETY: This function is called only once on the BSP.
+    unsafe {
+        mm::kspace::activate_kernel_page_table();
+    }
+
+    arch::irq::enable_local();
 
     invoke_ffi_init_funcs();
 }
+
+/// Indicates whether the kernel is in bootstrap context.
+pub static IN_BOOTSTRAP_CONTEXT: AtomicBool = AtomicBool::new(true);
 
 /// Invoke the initialization functions defined in the FFI.
 /// The component system uses this function to call the initialization functions of
@@ -109,6 +133,7 @@ mod test {
     use crate::prelude::*;
 
     #[ktest]
+    #[allow(clippy::eq_op)]
     fn trivial_assertion() {
         assert_eq!(0, 0);
     }
@@ -126,8 +151,14 @@ mod test {
     }
 }
 
-/// The module re-exports everything from the ktest crate
-#[cfg(ktest)]
+#[doc(hidden)]
 pub mod ktest {
+    //! The module re-exports everything from the [`ostd_test`] crate, as well
+    //! as the test entry point macro.
+    //!
+    //! It is rather discouraged to use the definitions here directly. The
+    //! `ktest` attribute is sufficient for all normal use cases.
+
+    pub use ostd_macros::test_main as main;
     pub use ostd_test::*;
 }

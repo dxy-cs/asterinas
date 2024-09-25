@@ -11,7 +11,7 @@ use align_ext::AlignExt;
 
 use crate::prelude::*;
 
-/// A fixed number of bits taht can be safely shared between threads.
+/// A fixed number of bits that can be safely shared between threads.
 pub struct AtomicBits {
     num_bits: usize,
     u64s: Box<[AtomicU64]>,
@@ -150,7 +150,7 @@ impl<'a> OnesIter<'a> {
         let mut new_self = Self {
             bits,
             u64_idx: 0,
-            u64_val: 0, // NOT initalized yet!
+            u64_val: 0, // NOT initialized yet!
             num_garbage_bits_in_last_u64,
         };
         new_self.u64_val = new_self.get_u64_val(0);
@@ -215,7 +215,7 @@ impl<'a> ZeroesIter<'a> {
         let mut new_self = Self {
             bits,
             u64_idx: 0,
-            u64_val: 0, // NOT initalized yet!
+            u64_val: 0, // NOT initialized yet!
             num_garbage_bits_in_last_u64,
         };
         new_self.u64_val = new_self.get_u64_val(0);
@@ -313,24 +313,24 @@ mod test {
     fn set_get() {
         let bits = AtomicBits::new_zeroes(128);
         for i in 0..bits.len() {
-            assert!(bits.get(i) == false);
+            assert!(!bits.get(i));
 
             bits.set(i, true);
-            assert!(bits.get(i) == true);
+            assert!(bits.get(i));
 
             bits.set(i, false);
-            assert!(bits.get(i) == false);
+            assert!(!bits.get(i));
         }
 
         let bits = AtomicBits::new_ones(128);
         for i in 0..bits.len() {
-            assert!(bits.get(i) == true);
+            assert!(bits.get(i));
 
             bits.set(i, false);
-            assert!(bits.get(i) == false);
+            assert!(!bits.get(i));
 
             bits.set(i, true);
-            assert!(bits.get(i) == true);
+            assert!(bits.get(i));
         }
     }
 
@@ -389,9 +389,9 @@ mod test {
     #[ktest]
     fn iter() {
         let bits = AtomicBits::new_zeroes(7);
-        assert!(bits.iter().all(|bit| bit == false));
+        assert!(bits.iter().all(|bit| !bit));
 
         let bits = AtomicBits::new_ones(128);
-        assert!(bits.iter().all(|bit| bit == true));
+        assert!(bits.iter().all(|bit| bit));
     }
 }

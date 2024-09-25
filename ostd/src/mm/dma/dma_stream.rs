@@ -3,20 +3,24 @@
 use alloc::sync::Arc;
 use core::ops::Range;
 
-#[cfg(feature = "intel_tdx")]
-use ::tdx_guest::tdx_is_enabled;
+use cfg_if::cfg_if;
 
 use super::{check_and_insert_dma_mapping, remove_dma_mapping, DmaError, HasDaddr};
-#[cfg(feature = "intel_tdx")]
-use crate::arch::tdx_guest;
 use crate::{
     arch::iommu,
     error::Error,
     mm::{
         dma::{dma_type, Daddr, DmaType},
-        HasPaddr, Paddr, Segment, VmIo, VmReader, VmWriter, PAGE_SIZE,
+        HasPaddr, Infallible, Paddr, Segment, VmIo, VmReader, VmWriter, PAGE_SIZE,
     },
 };
+
+cfg_if! {
+    if #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))] {
+        use ::tdx_guest::tdx_is_enabled;
+        use crate::arch::tdx_guest;
+    }
+}
 
 /// A streaming DMA mapping. Users must synchronize data
 /// before reading or after writing to ensure consistency.
@@ -68,7 +72,7 @@ impl DmaStream {
         start_paddr.checked_add(frame_count * PAGE_SIZE).unwrap();
         let start_daddr = match dma_type() {
             DmaType::Direct => {
-                #[cfg(feature = "intel_tdx")]
+                #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
                 // SAFETY:
                 // This is safe because we are ensuring that the physical address range specified by `start_paddr` and `frame_count` is valid before these operations.
                 // The `check_and_insert_dma_mapping` function checks if the physical address range is already mapped.
@@ -173,7 +177,7 @@ impl Drop for DmaStreamInner {
         start_paddr.checked_add(frame_count * PAGE_SIZE).unwrap();
         match dma_type() {
             DmaType::Direct => {
-                #[cfg(feature = "intel_tdx")]
+                #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
                 // SAFETY:
                 // This is safe because we are ensuring that the physical address range specified by `start_paddr` and `frame_count` is valid before these operations.
                 // The `start_paddr()` ensures the `start_paddr` is page-aligned.
@@ -198,25 +202,25 @@ impl Drop for DmaStreamInner {
 
 impl VmIo for DmaStream {
     /// Reads data into the buffer.
-    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<(), Error> {
+    fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<(), Error> {
         if self.inner.direction == DmaDirection::ToDevice {
             return Err(Error::AccessDenied);
         }
-        self.inner.vm_segment.read_bytes(offset, buf)
+        self.inner.vm_segment.read(offset, writer)
     }
 
     /// Writes data from the buffer.
-    fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<(), Error> {
+    fn write(&self, offset: usize, reader: &mut VmReader) -> Result<(), Error> {
         if self.inner.direction == DmaDirection::FromDevice {
             return Err(Error::AccessDenied);
         }
-        self.inner.vm_segment.write_bytes(offset, buf)
+        self.inner.vm_segment.write(offset, reader)
     }
 }
 
 impl<'a> DmaStream {
     /// Returns a reader to read data from it.
-    pub fn reader(&'a self) -> Result<VmReader<'a>, Error> {
+    pub fn reader(&'a self) -> Result<VmReader<'a, Infallible>, Error> {
         if self.inner.direction == DmaDirection::ToDevice {
             return Err(Error::AccessDenied);
         }
@@ -224,7 +228,7 @@ impl<'a> DmaStream {
     }
 
     /// Returns a writer to write data into it.
-    pub fn writer(&'a self) -> Result<VmWriter<'a>, Error> {
+    pub fn writer(&'a self) -> Result<VmWriter<'a, Infallible>, Error> {
         if self.inner.direction == DmaDirection::FromDevice {
             return Err(Error::AccessDenied);
         }
@@ -278,18 +282,18 @@ impl<'a> DmaStreamSlice<'a> {
 }
 
 impl VmIo for DmaStreamSlice<'_> {
-    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<(), Error> {
-        if buf.len() + offset > self.len {
+    fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<(), Error> {
+        if writer.avail() + offset > self.len {
             return Err(Error::InvalidArgs);
         }
-        self.stream.read_bytes(self.offset + offset, buf)
+        self.stream.read(self.offset + offset, writer)
     }
 
-    fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<(), Error> {
-        if buf.len() + offset > self.len {
+    fn write(&self, offset: usize, reader: &mut VmReader) -> Result<(), Error> {
+        if reader.remain() + offset > self.len {
             return Err(Error::InvalidArgs);
         }
-        self.stream.write_bytes(self.offset + offset, buf)
+        self.stream.write(self.offset + offset, reader)
     }
 }
 
@@ -333,6 +337,7 @@ mod test {
         let dma_stream_parent =
             DmaStream::map(vm_segment_parent, DmaDirection::Bidirectional, false);
         let dma_stream_child = DmaStream::map(vm_segment_child, DmaDirection::Bidirectional, false);
+        assert!(dma_stream_parent.is_ok());
         assert!(dma_stream_child.is_err());
     }
 
@@ -353,7 +358,7 @@ mod test {
     }
 
     #[ktest]
-    fn reader_and_wirter() {
+    fn reader_and_writer() {
         let vm_segment = FrameAllocOptions::new(2)
             .is_contiguous(true)
             .alloc_contiguous()

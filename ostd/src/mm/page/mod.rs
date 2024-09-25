@@ -73,7 +73,7 @@ impl<M: PageMeta> Page<M> {
 
         // Initialize the metadata
         // SAFETY: The pointer points to the first byte of the `MetaSlot`
-        // structure, and layout ensured enoungh space for `M`. The original
+        // structure, and layout ensured enough space for `M`. The original
         // value does not represent any object that's needed to be dropped.
         unsafe { (ptr as *mut M).write(metadata) };
 
@@ -123,11 +123,19 @@ impl<M: PageMeta> Page<M> {
     ///
     /// # Safety
     ///
-    /// The physical address must represent a valid page and the caller must already hold one
-    /// reference count.
+    /// The physical address must represent a valid page.
+    ///
+    /// And the caller must ensure the metadata slot pointed through the corresponding
+    /// virtual address is initialized by holding a reference count of the page firstly.
+    /// Otherwise the function may add a reference count to an unused page.
     pub(in crate::mm) unsafe fn inc_ref_count(paddr: Paddr) {
-        let page = unsafe { ManuallyDrop::new(Self::from_raw(paddr)) };
-        let _page = page.clone();
+        debug_assert!(paddr % PAGE_SIZE == 0);
+        debug_assert!(paddr < MAX_PADDR.load(Ordering::Relaxed) as Paddr);
+        let vaddr: Vaddr = mapping::page_to_meta::<PagingConsts>(paddr);
+        // SAFETY: The virtual address points to an initialized metadata slot.
+        (*(vaddr as *const MetaSlot))
+            .ref_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the physical address.
@@ -154,6 +162,21 @@ impl<M: PageMeta> Page<M> {
     /// Get the metadata of this page.
     pub fn meta(&self) -> &M {
         unsafe { &*(self.ptr as *const M) }
+    }
+
+    /// Get the reference count of the page.
+    ///
+    /// It returns the number of all references to the page, including all the
+    /// existing page handles ([`Page`], [`DynPage`]), and all the mappings in the
+    /// page table that points to the page.
+    ///
+    /// # Safety
+    ///
+    /// The function is safe to call, but using it requires extra care. The
+    /// reference count can be changed by other threads at any time including
+    /// potentially between calling this method and acting on the result.
+    pub fn reference_count(&self) -> u32 {
+        self.ref_count().load(Ordering::Relaxed)
     }
 
     fn ref_count(&self) -> &AtomicU32 {
@@ -229,11 +252,14 @@ impl DynPage {
     ///
     /// # Safety
     ///
-    /// The physical address must represent a valid page and the caller must already hold one
-    /// reference count.
+    /// This is the same as [`Page::inc_ref_count`].
     pub(in crate::mm) unsafe fn inc_ref_count(paddr: Paddr) {
-        let page = unsafe { ManuallyDrop::new(Self::from_raw(paddr)) };
-        let _page = page.clone();
+        debug_assert!(paddr % PAGE_SIZE == 0);
+        debug_assert!(paddr < MAX_PADDR.load(Ordering::Relaxed) as Paddr);
+        let vaddr: Vaddr = mapping::page_to_meta::<PagingConsts>(paddr);
+        (*(vaddr as *const MetaSlot))
+            .ref_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the physical address of the start of the page

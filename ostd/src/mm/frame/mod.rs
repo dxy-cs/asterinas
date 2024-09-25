@@ -15,13 +15,16 @@ use core::mem::ManuallyDrop;
 
 pub use segment::Segment;
 
-use super::page::{
-    meta::{FrameMeta, MetaSlot, PageMeta, PageUsage},
-    DynPage, Page,
+use super::{
+    page::{
+        meta::{FrameMeta, MetaSlot, PageMeta, PageUsage},
+        DynPage, Page,
+    },
+    Infallible,
 };
 use crate::{
     mm::{
-        io::{VmIo, VmReader, VmWriter},
+        io::{FallibleVmRead, FallibleVmWrite, VmIo, VmReader, VmWriter},
         paddr_to_vaddr, HasPaddr, Paddr, PAGE_SIZE,
     },
     Error, Result,
@@ -77,6 +80,21 @@ impl Frame {
             core::ptr::copy_nonoverlapping(src.as_ptr(), self.as_mut_ptr(), self.size());
         }
     }
+
+    /// Get the reference count of the frame.
+    ///
+    /// It returns the number of all references to the page, including all the
+    /// existing page handles ([`Frame`]) and all the mappings in the page
+    /// table that points to the page.
+    ///
+    /// # Safety
+    ///
+    /// The function is safe to call, but using it requires extra care. The
+    /// reference count can be changed by other threads at any time including
+    /// potentially between calling this method and acting on the result.
+    pub fn reference_count(&self) -> u32 {
+        self.page.reference_count()
+    }
 }
 
 impl From<Page<FrameMeta>> for Frame {
@@ -111,61 +129,74 @@ impl HasPaddr for Frame {
 
 impl<'a> Frame {
     /// Returns a reader to read data from it.
-    pub fn reader(&'a self) -> VmReader<'a> {
-        // SAFETY: the memory of the page is untyped, contiguous and is valid during `'a`.
-        // Currently, only slice can generate `VmWriter` with typed memory, and this `Frame` cannot
-        // generate or be generated from an alias slice, so the reader will not overlap with `VmWriter`
-        // with typed memory.
+    pub fn reader(&'a self) -> VmReader<'a, Infallible> {
+        // SAFETY:
+        // - The memory range points to untyped memory.
+        // - The frame is alive during the lifetime `'a`.
+        // - Using `VmReader` and `VmWriter` is the only way to access the frame.
         unsafe { VmReader::from_kernel_space(self.as_ptr(), self.size()) }
     }
 
     /// Returns a writer to write data into it.
-    pub fn writer(&'a self) -> VmWriter<'a> {
-        // SAFETY: the memory of the page is untyped, contiguous and is valid during `'a`.
-        // Currently, only slice can generate `VmReader` with typed memory, and this `Frame` cannot
-        // generate or be generated from an alias slice, so the writer will not overlap with `VmReader`
-        // with typed memory.
+    pub fn writer(&'a self) -> VmWriter<'a, Infallible> {
+        // SAFETY:
+        // - The memory range points to untyped memory.
+        // - The frame is alive during the lifetime `'a`.
+        // - Using `VmReader` and `VmWriter` is the only way to access the frame.
         unsafe { VmWriter::from_kernel_space(self.as_mut_ptr(), self.size()) }
     }
 }
 
 impl VmIo for Frame {
-    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+    fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<()> {
+        let read_len = writer.avail().min(self.size().saturating_sub(offset));
         // Do bound check with potential integer overflow in mind
-        let max_offset = offset.checked_add(buf.len()).ok_or(Error::Overflow)?;
+        let max_offset = offset.checked_add(read_len).ok_or(Error::Overflow)?;
         if max_offset > self.size() {
             return Err(Error::InvalidArgs);
         }
-        let len = self.reader().skip(offset).read(&mut buf.into());
-        debug_assert!(len == buf.len());
+        let len = self
+            .reader()
+            .skip(offset)
+            .read_fallible(writer)
+            .map_err(|(e, _)| e)?;
+        debug_assert!(len == read_len);
         Ok(())
     }
 
-    fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<()> {
+    fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
+        let write_len = reader.remain().min(self.size().saturating_sub(offset));
         // Do bound check with potential integer overflow in mind
-        let max_offset = offset.checked_add(buf.len()).ok_or(Error::Overflow)?;
+        let max_offset = offset.checked_add(write_len).ok_or(Error::Overflow)?;
         if max_offset > self.size() {
             return Err(Error::InvalidArgs);
         }
-        let len = self.writer().skip(offset).write(&mut buf.into());
-        debug_assert!(len == buf.len());
+        let len = self
+            .writer()
+            .skip(offset)
+            .write_fallible(reader)
+            .map_err(|(e, _)| e)?;
+        debug_assert!(len == write_len);
         Ok(())
     }
 }
 
 impl VmIo for alloc::vec::Vec<Frame> {
-    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+    fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<()> {
         // Do bound check with potential integer overflow in mind
-        let max_offset = offset.checked_add(buf.len()).ok_or(Error::Overflow)?;
+        let max_offset = offset.checked_add(writer.avail()).ok_or(Error::Overflow)?;
         if max_offset > self.len() * PAGE_SIZE {
             return Err(Error::InvalidArgs);
         }
 
         let num_skip_pages = offset / PAGE_SIZE;
         let mut start = offset % PAGE_SIZE;
-        let mut buf_writer: VmWriter = buf.into();
         for frame in self.iter().skip(num_skip_pages) {
-            let read_len = frame.reader().skip(start).read(&mut buf_writer);
+            let read_len = frame
+                .reader()
+                .skip(start)
+                .read_fallible(writer)
+                .map_err(|(e, _)| e)?;
             if read_len == 0 {
                 break;
             }
@@ -174,18 +205,21 @@ impl VmIo for alloc::vec::Vec<Frame> {
         Ok(())
     }
 
-    fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<()> {
+    fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
         // Do bound check with potential integer overflow in mind
-        let max_offset = offset.checked_add(buf.len()).ok_or(Error::Overflow)?;
+        let max_offset = offset.checked_add(reader.remain()).ok_or(Error::Overflow)?;
         if max_offset > self.len() * PAGE_SIZE {
             return Err(Error::InvalidArgs);
         }
 
         let num_skip_pages = offset / PAGE_SIZE;
         let mut start = offset % PAGE_SIZE;
-        let mut buf_reader: VmReader = buf.into();
         for frame in self.iter().skip(num_skip_pages) {
-            let write_len = frame.writer().skip(start).write(&mut buf_reader);
+            let write_len = frame
+                .writer()
+                .skip(start)
+                .write_fallible(reader)
+                .map_err(|(e, _)| e)?;
             if write_len == 0 {
                 break;
             }

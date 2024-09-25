@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #![no_std]
+// The feature `linkage` is required for `ostd::main` to work.
+#![feature(linkage)]
 
 extern crate alloc;
 
@@ -13,8 +15,8 @@ use alloc::vec;
 use ostd::arch::qemu::{exit_qemu, QemuExitCode};
 use ostd::cpu::UserContext;
 use ostd::mm::{
-    CachePolicy, FrameAllocOptions, PageFlags, PageProperty, Vaddr, VmIo, VmSpace, VmWriter,
-    PAGE_SIZE,
+    CachePolicy, FallibleVmRead, FallibleVmWrite, FrameAllocOptions, PageFlags, PageProperty,
+    Vaddr, VmIo, VmSpace, VmWriter, PAGE_SIZE,
 };
 use ostd::prelude::*;
 use ostd::task::{Task, TaskOptions};
@@ -36,7 +38,7 @@ fn create_user_space(program: &[u8]) -> UserSpace {
     let nframes = program.len().align_up(PAGE_SIZE) / PAGE_SIZE;
     let user_pages = {
         let vm_frames = FrameAllocOptions::new(nframes).alloc().unwrap();
-        // Phyiscal memory pages can be only accessed
+        // Physical memory pages can be only accessed
         // via the Frame abstraction.
         vm_frames.write_bytes(0, program).unwrap();
         vm_frames
@@ -55,6 +57,7 @@ fn create_user_space(program: &[u8]) -> UserSpace {
         for frame in user_pages {
             cursor.map(frame, map_prop);
         }
+        drop(cursor);
         Arc::new(vm_space)
     };
     let user_cpu_state = {
@@ -72,7 +75,7 @@ fn create_user_space(program: &[u8]) -> UserSpace {
 
 fn create_user_task(user_space: Arc<UserSpace>) -> Arc<Task> {
     fn user_task() {
-        let current = Task::current();
+        let current = Task::current().unwrap();
         // Switching between user-kernel space is
         // performed via the UserMode abstraction.
         let mut user_mode = {
@@ -99,11 +102,13 @@ fn create_user_task(user_space: Arc<UserSpace>) -> Arc<Task> {
     // Kernel tasks are managed by the Framework,
     // while scheduling algorithms for them can be
     // determined by the users of the Framework.
-    TaskOptions::new(user_task)
-        .user_space(Some(user_space))
-        .data(0)
-        .build()
-        .unwrap()
+    Arc::new(
+        TaskOptions::new(user_task)
+            .user_space(Some(user_space))
+            .data(0)
+            .build()
+            .unwrap(),
+    )
 }
 
 fn handle_syscall(user_context: &mut UserContext, user_space: &UserSpace) {

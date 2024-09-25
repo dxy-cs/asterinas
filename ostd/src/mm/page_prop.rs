@@ -106,7 +106,7 @@ bitflags! {
         const X = 0b00000100;
         /// Readable + writable.
         const RW = Self::R.bits | Self::W.bits;
-        /// Readable + execuable.
+        /// Readable + executable.
         const RX = Self::R.bits | Self::X.bits;
         /// Readable + writable + executable.
         const RWX = Self::R.bits | Self::W.bits | Self::X.bits;
@@ -128,7 +128,7 @@ bitflags! {
 
         /// (TEE only) If the page is shared with the host.
         /// Otherwise the page is ensured confidential and not visible outside the guest.
-        #[cfg(feature = "intel_tdx")]
+        #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
         const SHARED    = 0b10000000;
     }
 }

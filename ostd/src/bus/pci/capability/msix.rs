@@ -7,20 +7,24 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
-#[cfg(feature = "intel_tdx")]
-use ::tdx_guest::tdx_is_enabled;
+use cfg_if::cfg_if;
 
-#[cfg(feature = "intel_tdx")]
-use crate::arch::tdx_guest;
 use crate::{
     bus::pci::{
         cfg_space::{Bar, Command, MemoryBar},
         common_device::PciCommonDevice,
         device_info::PciDeviceLocation,
     },
-    mm::VmIo,
+    mm::VmIoOnce,
     trap::IrqLine,
 };
+
+cfg_if! {
+    if #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))] {
+        use ::tdx_guest::tdx_is_enabled;
+        use crate::arch::tdx_guest;
+    }
+}
 
 /// MSI-X capability. It will set the BAR space it uses to be hidden.
 #[derive(Debug)]
@@ -100,7 +104,7 @@ impl CapabilityMsixData {
 
         // Set message address 0xFEE0_0000
         for i in 0..table_size {
-            #[cfg(feature = "intel_tdx")]
+            #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
             // SAFETY:
             // This is safe because we are ensuring that the physical address of the MSI-X table is valid before this operation.
             // We are also ensuring that we are only unprotecting a single page.
@@ -117,15 +121,15 @@ impl CapabilityMsixData {
             // Set message address and disable this msix entry
             table_bar
                 .io_mem()
-                .write_val((16 * i) as usize + table_offset, &message_address)
+                .write_once((16 * i) as usize + table_offset, &message_address)
                 .unwrap();
             table_bar
                 .io_mem()
-                .write_val((16 * i + 4) as usize + table_offset, &message_upper_address)
+                .write_once((16 * i + 4) as usize + table_offset, &message_upper_address)
                 .unwrap();
             table_bar
                 .io_mem()
-                .write_val((16 * i + 12) as usize + table_offset, &1_u32)
+                .write_once((16 * i + 12) as usize + table_offset, &1_u32)
                 .unwrap();
         }
 
@@ -165,7 +169,7 @@ impl CapabilityMsixData {
         }
         self.table_bar
             .io_mem()
-            .write_val(
+            .write_once(
                 (16 * index + 8) as usize + self.table_offset,
                 &(handle.num() as u32),
             )
@@ -174,7 +178,7 @@ impl CapabilityMsixData {
         // Enable this msix vector
         self.table_bar
             .io_mem()
-            .write_val((16 * index + 12) as usize + self.table_offset, &0_u32)
+            .write_once((16 * index + 12) as usize + self.table_offset, &0_u32)
             .unwrap();
     }
 

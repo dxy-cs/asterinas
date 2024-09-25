@@ -13,7 +13,7 @@ pub mod x2apic;
 pub mod xapic;
 
 cpu_local! {
-    static APIC_INSTANCE: Once<RefCell<Box<dyn Apic + 'static>>> = Once::new();
+    static APIC_INSTANCE: RefCell<Option<Box<dyn Apic + 'static>>> = RefCell::new(None);
 }
 
 static APIC_TYPE: Once<ApicType> = Once::new();
@@ -22,24 +22,31 @@ static APIC_TYPE: Once<ApicType> = Once::new();
 ///
 /// You should provide a closure operating on the given mutable borrow of the
 /// local APIC instance. During the execution of the closure, the interrupts
-/// are guarenteed to be disabled.
+/// are guaranteed to be disabled.
+///
+/// This function also lazily initializes the Local APIC instance. It does
+/// enable the Local APIC if it is not enabled.
 ///
 /// Example:
 /// ```rust
 /// use ostd::arch::x86::kernel::apic;
 ///
-/// let ticks = apic::borrow(|apic| {
+/// let ticks = apic::with_borrow(|apic| {
 ///     let ticks = apic.timer_current_count();
 ///     apic.set_timer_init_count(0);
 ///     ticks
 /// });
 /// ```
-pub fn borrow<R>(f: impl FnOnce(&mut (dyn Apic + 'static)) -> R) -> R {
-    let apic_guard = APIC_INSTANCE.borrow_irq_disabled();
+pub fn with_borrow<R>(f: impl FnOnce(&mut (dyn Apic + 'static)) -> R) -> R {
+    let irq_guard = crate::trap::disable_local();
+    let apic_guard = APIC_INSTANCE.get_with(&irq_guard);
+    let mut apic_init_ref = apic_guard.borrow_mut();
 
-    // If it is not initialzed, lazily initialize it.
-    if !apic_guard.is_completed() {
-        apic_guard.call_once(|| match APIC_TYPE.get().unwrap() {
+    // If it is not initialized, lazily initialize it.
+    let apic_ref = if let Some(apic_ref) = apic_init_ref.as_mut() {
+        apic_ref
+    } else {
+        *apic_init_ref = Some(match APIC_TYPE.get().unwrap() {
             ApicType::XApic => {
                 let mut xapic = xapic::XApic::new().unwrap();
                 xapic.enable();
@@ -50,7 +57,7 @@ pub fn borrow<R>(f: impl FnOnce(&mut (dyn Apic + 'static)) -> R) -> R {
                     version & 0xff,
                     (version >> 16) & 0xff
                 );
-                RefCell::new(Box::new(xapic))
+                Box::new(xapic)
             }
             ApicType::X2Apic => {
                 let mut x2apic = x2apic::X2Apic::new().unwrap();
@@ -62,13 +69,12 @@ pub fn borrow<R>(f: impl FnOnce(&mut (dyn Apic + 'static)) -> R) -> R {
                     version & 0xff,
                     (version >> 16) & 0xff
                 );
-                RefCell::new(Box::new(x2apic))
+                Box::new(x2apic)
             }
         });
-    }
 
-    let apic_cell = apic_guard.get().unwrap();
-    let mut apic_ref = apic_cell.borrow_mut();
+        apic_init_ref.as_mut().unwrap()
+    };
 
     let ret = f.call_once((apic_ref.as_mut(),));
 
@@ -114,7 +120,7 @@ enum ApicType {
 /// The inter-processor interrupt control register.
 ///
 /// ICR is a 64-bit local APIC register that allows software running on the
-/// porcessor to specify and send IPIs to other porcessors in the system.
+/// processor to specify and send IPIs to other processors in the system.
 /// To send an IPI, software must set up the ICR to indicate the type of IPI
 /// message to be sent and the destination processor or processors. (All fields
 /// of the ICR are read-write by software with the exception of the delivery
@@ -237,7 +243,6 @@ impl From<u32> for ApicId {
 /// in the system excluding the sender.
 #[repr(u64)]
 pub enum DestinationShorthand {
-    #[allow(dead_code)]
     NoShorthand = 0b00,
     #[allow(dead_code)]
     MySelf = 0b01,
@@ -247,7 +252,7 @@ pub enum DestinationShorthand {
 
 #[repr(u64)]
 pub enum TriggerMode {
-    Egde = 0,
+    Edge = 0,
     Level = 1,
 }
 
@@ -277,7 +282,6 @@ pub enum DestinationMode {
 #[repr(u64)]
 pub enum DeliveryMode {
     /// Delivers the interrupt specified in the vector field to the target processor or processors.
-    #[allow(dead_code)]
     Fixed = 0b000,
     /// Same as fixed mode, except that the interrupt is delivered to the processor executing at
     /// the lowest priority among the set of processors specified in the destination field. The
@@ -296,7 +300,7 @@ pub enum DeliveryMode {
     /// perform an initialization.
     Init = 0b101,
     /// Start-up Interrupt
-    StrartUp = 0b110,
+    StartUp = 0b110,
 }
 
 #[derive(Debug)]

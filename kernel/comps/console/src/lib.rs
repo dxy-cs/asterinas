@@ -11,10 +11,13 @@ use alloc::{collections::BTreeMap, fmt::Debug, string::String, sync::Arc, vec::V
 use core::any::Any;
 
 use component::{init_component, ComponentInitError};
-use ostd::{mm::VmReader, sync::SpinLock};
+use ostd::{
+    mm::{Infallible, VmReader},
+    sync::SpinLock,
+};
 use spin::Once;
 
-pub type ConsoleCallback = dyn Fn(VmReader) + Send + Sync;
+pub type ConsoleCallback = dyn Fn(VmReader<Infallible>) + Send + Sync;
 
 pub trait AnyConsoleDevice: Send + Sync + Any + Debug {
     fn send(&self, buf: &[u8]);
@@ -31,7 +34,8 @@ pub fn register_device(name: String, device: Arc<dyn AnyConsoleDevice>) {
         .get()
         .unwrap()
         .console_device_table
-        .lock_irq_disabled()
+        .disable_irq()
+        .lock()
         .insert(name, device);
 }
 
@@ -40,7 +44,8 @@ pub fn all_devices() -> Vec<(String, Arc<dyn AnyConsoleDevice>)> {
         .get()
         .unwrap()
         .console_device_table
-        .lock_irq_disabled();
+        .disable_irq()
+        .lock();
     console_devs
         .iter()
         .map(|(name, device)| (name.clone(), device.clone()))

@@ -1,14 +1,54 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(unused_variables)]
+//! Abstractions for reading and writing virtual memory (VM) objects.
+//!
+//! # Safety
+//!
+//! The core virtual memory (VM) access APIs provided by this module are [`VmReader`] and
+//! [`VmWriter`], which allow for writing to or reading from a region of memory _safely_.
+//! `VmReader` and `VmWriter` objects can be constructed from memory regions of either typed memory
+//! (e.g., `&[u8]`) or untyped memory (e.g, [`Frame`]). Behind the scene, `VmReader` and `VmWriter`
+//! must be constructed via their [`from_user_space`] and [`from_kernel_space`] methods, whose
+//! safety depends on whether the given memory regions are _valid_ or not.
+//!
+//! [`Frame`]: crate::mm::Frame
+//! [`from_user_space`]: `VmReader::from_user_space`
+//! [`from_kernel_space`]: `VmReader::from_kernel_space`
+//!
+//! Here is a list of conditions for memory regions to be considered valid:
+//!
+//! - The memory region as a whole must be either typed or untyped memory, not both typed and
+//!   untyped.
+//!
+//! - If the memory region is typed, we require that:
+//!   - the [validity requirements] from the official Rust documentation must be met, and
+//!   - the type of the memory region (which must exist since the memory is typed) must be
+//!     plain-old-data, so that the writer can fill it with arbitrary data safely.
+//!
+//! [validity requirements]: core::ptr#safety
+//!
+//! - If the memory region is untyped, we require that:
+//!   - the underlying pages must remain alive while the validity requirements are in effect, and
+//!   - the kernel must access the memory region using only the APIs provided in this module, but
+//!     external accesses from hardware devices or user programs do not count.
+//!
+//! We have the last requirement for untyped memory to be valid because the safety interaction with
+//! other ways to access the memory region (e.g., atomic/volatile memory loads/stores) is not
+//! currently specified. Tis may be relaxed in the future, if appropriate and necessary.
+//!
+//! Note that data races on untyped memory are explicitly allowed (since pages can be mapped to
+//! user space, making it impossible to avoid data races). However, they may produce erroneous
+//! results, such as unexpected bytes being copied, but do not cause soundness problems.
 
+use alloc::vec;
 use core::marker::PhantomData;
 
 use align_ext::AlignExt;
+use const_assert::{Assert, IsTrue};
 use inherit_methods_macro::inherit_methods;
 
 use crate::{
-    arch::mm::__memcpy_fallible,
+    arch::mm::{__memcpy_fallible, __memset_fallible},
     mm::{
         kspace::{KERNEL_BASE_VADDR, KERNEL_END_VADDR},
         MAX_USERSPACE_VADDR,
@@ -30,14 +70,26 @@ use crate::{
 /// [`Segment`]: crate::mm::Segment
 /// [`Frame`]: crate::mm::Frame
 pub trait VmIo: Send + Sync {
+    /// Reads requested data at a specified offset into a given `VmWriter`.
+    ///
+    /// # No short reads
+    ///
+    /// On success, the `writer` must be written with the requested data
+    /// completely. If, for any reason, the requested data is only partially
+    /// available, then the method shall return an error.
+    fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<()>;
+
     /// Reads a specified number of bytes at a specified offset into a given buffer.
     ///
     /// # No short reads
     ///
-    /// On success, the output `buf` must be filled with the requested data
-    /// completely. If, for any reason, the requested data is only partially
-    /// available, then the method shall return an error.
-    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<()>;
+    /// Similar to [`read`].
+    ///
+    /// [`read`]: VmIo::read
+    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+        let mut writer = VmWriter::from(buf).to_fallible();
+        self.read(offset, &mut writer)
+    }
 
     /// Reads a value of a specified type at a specified offset.
     fn read_val<T: Pod>(&self, offset: usize) -> Result<T> {
@@ -50,9 +102,9 @@ pub trait VmIo: Send + Sync {
     ///
     /// # No short reads
     ///
-    /// Similar to [`read_bytes`].
+    /// Similar to [`read`].
     ///
-    /// [`read_bytes`]: VmIo::read_bytes
+    /// [`read`]: VmIo::read
     fn read_slice<T: Pod>(&self, offset: usize, slice: &mut [T]) -> Result<()> {
         let len_in_bytes = core::mem::size_of_val(slice);
         let ptr = slice as *mut [T] as *mut u8;
@@ -62,14 +114,26 @@ pub trait VmIo: Send + Sync {
         self.read_bytes(offset, buf)
     }
 
+    /// Writes all data from a given `VmReader` at a specified offset.
+    ///
+    /// # No short writes
+    ///
+    /// On success, the data from the `reader` must be read to the VM object entirely.
+    /// If, for any reason, the input data can only be written partially,
+    /// then the method shall return an error.
+    fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()>;
+
     /// Writes a specified number of bytes from a given buffer at a specified offset.
     ///
     /// # No short writes
     ///
-    /// On success, the input `buf` must be written to the VM object entirely.
-    /// If, for any reason, the input data can only be written partially,
-    /// then the method shall return an error.
-    fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<()>;
+    /// Similar to [`write`].
+    ///
+    /// [`write`]: VmIo::write
+    fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<()> {
+        let mut reader = VmReader::from(buf).to_fallible();
+        self.write(offset, &mut reader)
+    }
 
     /// Writes a value of a specified type at a specified offset.
     fn write_val<T: Pod>(&self, offset: usize, new_val: &T) -> Result<()> {
@@ -81,9 +145,9 @@ pub trait VmIo: Send + Sync {
     ///
     /// # No short write
     ///
-    /// Similar to [`write_bytes`].
+    /// Similar to [`write`].
     ///
-    /// [`write_bytes`]: VmIo::write_bytes
+    /// [`write`]: VmIo::write
     fn write_slice<T: Pod>(&self, offset: usize, slice: &[T]) -> Result<()> {
         let len_in_bytes = core::mem::size_of_val(slice);
         let ptr = slice as *const [T] as *const u8;
@@ -155,13 +219,36 @@ pub trait VmIo: Send + Sync {
     }
 }
 
-macro_rules! impl_vmio_pointer {
+/// A trait that enables reading/writing data from/to a VM object using one non-tearing memory
+/// load/store.
+///
+/// See also [`VmIo`], which enables reading/writing data from/to a VM object without the guarantee
+/// of using one non-tearing memory load/store.
+pub trait VmIoOnce {
+    /// Reads a value of the `PodOnce` type at the specified offset using one non-tearing memory
+    /// load.
+    ///
+    /// Except that the offset is specified explicitly, the semantics of this method is the same as
+    /// [`VmReader::read_once`].
+    fn read_once<T: PodOnce>(&self, offset: usize) -> Result<T>;
+
+    /// Writes a value of the `PodOnce` type at the specified offset using one non-tearing memory
+    /// store.
+    ///
+    /// Except that the offset is specified explicitly, the semantics of this method is the same as
+    /// [`VmWriter::write_once`].
+    fn write_once<T: PodOnce>(&self, offset: usize, new_val: &T) -> Result<()>;
+}
+
+macro_rules! impl_vm_io_pointer {
     ($typ:ty,$from:tt) => {
         #[inherit_methods(from = $from)]
         impl<T: VmIo> VmIo for $typ {
+            fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<()>;
             fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<()>;
             fn read_val<F: Pod>(&self, offset: usize) -> Result<F>;
             fn read_slice<F: Pod>(&self, offset: usize, slice: &mut [F]) -> Result<()>;
+            fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()>;
             fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<()>;
             fn write_val<F: Pod>(&self, offset: usize, new_val: &F) -> Result<()>;
             fn write_slice<F: Pod>(&self, offset: usize, slice: &[F]) -> Result<()>;
@@ -169,38 +256,42 @@ macro_rules! impl_vmio_pointer {
     };
 }
 
-impl_vmio_pointer!(&T, "(**self)");
-impl_vmio_pointer!(&mut T, "(**self)");
-impl_vmio_pointer!(Box<T>, "(**self)");
-impl_vmio_pointer!(Arc<T>, "(**self)");
+impl_vm_io_pointer!(&T, "(**self)");
+impl_vm_io_pointer!(&mut T, "(**self)");
+impl_vm_io_pointer!(Box<T>, "(**self)");
+impl_vm_io_pointer!(Arc<T>, "(**self)");
+
+macro_rules! impl_vm_io_once_pointer {
+    ($typ:ty,$from:tt) => {
+        #[inherit_methods(from = $from)]
+        impl<T: VmIoOnce> VmIoOnce for $typ {
+            fn read_once<F: PodOnce>(&self, offset: usize) -> Result<F>;
+            fn write_once<F: PodOnce>(&self, offset: usize, new_val: &F) -> Result<()>;
+        }
+    };
+}
+
+impl_vm_io_once_pointer!(&T, "(**self)");
+impl_vm_io_once_pointer!(&mut T, "(**self)");
+impl_vm_io_once_pointer!(Box<T>, "(**self)");
+impl_vm_io_once_pointer!(Arc<T>, "(**self)");
 
 /// A marker structure used for [`VmReader`] and [`VmWriter`],
-/// representing their operated memory scope is in user space.
-pub struct UserSpace;
-
+/// representing whether reads or writes on the underlying memory region are fallible.
+pub struct Fallible;
 /// A marker structure used for [`VmReader`] and [`VmWriter`],
-/// representing their operated memory scope is in kernel space.
-pub struct KernelSpace;
+/// representing whether reads or writes on the underlying memory region are infallible.
+pub struct Infallible;
 
 /// Copies `len` bytes from `src` to `dst`.
 ///
 /// # Safety
 ///
-/// - Mappings of virtual memory range [`src`..`src` + len] and [`dst`..`dst` + len]
-///   must be [valid].
-/// - If one of the memory represents typed memory, these two virtual
-///   memory ranges and their corresponding physical pages should _not_ overlap.
+/// - `src` must be [valid] for reads of `len` bytes.
+/// - `dst` must be [valid] for writes of `len` bytes.
 ///
-/// Operation on typed memory may be safe only if it is plain-old-data. Otherwise,
-/// the safety requirements of [`core::ptr::copy`] should also be considered,
-/// except for the requirement that no concurrent access is allowed.
-///
-/// [valid]: core::ptr#safety
+/// [valid]: crate::mm::io#safety
 unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) {
-    // The safety conditions of this method explicitly allow data races on untyped memory because
-    // this method can be used to copy data to/from a page that is also mapped to user space, so
-    // avoiding data races is not feasible in this case.
-    //
     // This method is implemented by calling `volatile_copy_memory`. Note that even with the
     // "volatile" keyword, data races are still considered undefined behavior (UB) in both the Rust
     // documentation and the C/C++ standards. In general, UB makes the behavior of the entire
@@ -219,29 +310,75 @@ unsafe fn memcpy(dst: *mut u8, src: *const u8, len: usize) {
 ///
 /// Returns the number of successfully copied bytes.
 ///
+/// In the following cases, this method may cause unexpected bytes to be copied, but will not cause
+/// safety problems as long as the safety requirements are met:
+/// - The source and destination overlap.
+/// - The current context is not associated with valid user space (e.g., in the kernel thread).
+///
 /// # Safety
 ///
-/// - Users should ensure one of [`src`..`src` + len] and [`dst`..`dst` + len]
-///   is in user space, and the other virtual memory range is in kernel space
-///   and is ensured to be [valid].
-/// - Users should ensure this function only be invoked when a suitable page
-///   table is activated.
-/// - The underlying physical memory range of [`src`..`src` + len] and [`dst`..`dst` + len]
-///   should _not_ overlap if the kernel space memory represent typed memory.
+/// - `src` must either be [valid] for reads of `len` bytes or be in user space for `len` bytes.
+/// - `dst` must either be [valid] for writes of `len` bytes or be in user space for `len` bytes.
 ///
-/// [valid]: core::ptr#safety
+/// [valid]: crate::mm::io#safety
 unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, len: usize) -> usize {
     let failed_bytes = __memcpy_fallible(dst, src, len);
     len - failed_bytes
+}
+
+/// Fills `len` bytes of memory at `dst` with the specified `value`.
+/// This function will early stop filling if encountering an unresolvable page fault.
+///
+/// Returns the number of successfully set bytes.
+///
+/// # Safety
+///
+/// - `dst` must either be [valid] for writes of `len` bytes or be in user space for `len` bytes.
+///
+/// [valid]: crate::mm::io#safety
+unsafe fn memset_fallible(dst: *mut u8, value: u8, len: usize) -> usize {
+    let failed_bytes = __memset_fallible(dst, value, len);
+    len - failed_bytes
+}
+
+/// Fallible memory read from a `VmWriter`.
+pub trait FallibleVmRead<F> {
+    /// Reads all data into the writer until one of the three conditions is met:
+    /// 1. The reader has no remaining data.
+    /// 2. The writer has no available space.
+    /// 3. The reader/writer encounters some error.
+    ///
+    /// On success, the number of bytes read is returned;
+    /// On error, both the error and the number of bytes read so far are returned.
+    fn read_fallible(
+        &mut self,
+        writer: &mut VmWriter<'_, F>,
+    ) -> core::result::Result<usize, (Error, usize)>;
+}
+
+/// Fallible memory write from a `VmReader`.
+pub trait FallibleVmWrite<F> {
+    /// Writes all data from the reader until one of the three conditions is met:
+    /// 1. The reader has no remaining data.
+    /// 2. The writer has no available space.
+    /// 3. The reader/writer encounters some error.
+    ///
+    /// On success, the number of bytes written is returned;
+    /// On error, both the error and the number of bytes written so far are returned.
+    fn write_fallible(
+        &mut self,
+        reader: &mut VmReader<'_, F>,
+    ) -> core::result::Result<usize, (Error, usize)>;
 }
 
 /// `VmReader` is a reader for reading data from a contiguous range of memory.
 ///
 /// The memory range read by `VmReader` can be in either kernel space or user space.
 /// When the operating range is in kernel space, the memory within that range
-/// is guaranteed to be valid.
+/// is guaranteed to be valid, and the corresponding memory reads are infallible.
 /// When the operating range is in user space, it is ensured that the page table of
-/// the process creating the `VmReader` is active for the duration of `'a`.
+/// the process creating the `VmReader` is active for the duration of `'a`,
+/// and the corresponding memory reads are considered fallible.
 ///
 /// When perform reading with a `VmWriter`, if one of them represents typed memory,
 /// it can ensure that the reading range in this reader and writing range in the
@@ -251,39 +388,27 @@ unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, len: usize) -> usize {
 /// and physical address level. There is not guarantee for the operation results
 /// of `VmReader` and `VmWriter` in overlapping untyped addresses, and it is
 /// the user's responsibility to handle this situation.
-pub struct VmReader<'a, Space = KernelSpace> {
+pub struct VmReader<'a, Fallibility = Fallible> {
     cursor: *const u8,
     end: *const u8,
-    phantom: PhantomData<(&'a [u8], Space)>,
+    phantom: PhantomData<(&'a [u8], Fallibility)>,
 }
 
 macro_rules! impl_read_fallible {
-    ($read_space:ty, $write_space:ty) => {
-        impl<'a> VmReader<'a, $read_space> {
-            /// Reads all data into the writer until one of the three conditions is met:
-            /// 1. The reader has no remaining data.
-            /// 2. The writer has no available space.
-            /// 3. The reader/writer encounters some error.
-            ///
-            /// On success, the number of bytes read is returned;
-            /// On error, both the error and the number of bytes read so far are returned.
-            pub fn read_fallible(
+    ($reader_fallibility:ty, $writer_fallibility:ty) => {
+        impl<'a> FallibleVmRead<$writer_fallibility> for VmReader<'a, $reader_fallibility> {
+            fn read_fallible(
                 &mut self,
-                writer: &mut VmWriter<'_, $write_space>,
+                writer: &mut VmWriter<'_, $writer_fallibility>,
             ) -> core::result::Result<usize, (Error, usize)> {
                 let copy_len = self.remain().min(writer.avail());
                 if copy_len == 0 {
                     return Ok(0);
                 }
 
-                // SAFETY: This method is only implemented when one of the operated
-                // `VmReader` or `VmWriter` is in user space.
-                // The the corresponding page table of the user space memory is
-                // guaranteed to be activated due to its construction requirement.
-                // The kernel space memory range will be valid since `copy_len` is the minimum
-                // of the reader's remaining data and the writer's available space, and will
-                // not overlap with user space memory range in physical address level if it
-                // represents typed memory.
+                // SAFETY: The source and destination are subsets of memory ranges specified by
+                // the reader and writer, so they are either valid for reading and writing or in
+                // user space.
                 let copied_len = unsafe {
                     let copied_len = memcpy_fallible(writer.cursor, self.cursor, copy_len);
                     self.cursor = self.cursor.add(copied_len);
@@ -301,18 +426,11 @@ macro_rules! impl_read_fallible {
 }
 
 macro_rules! impl_write_fallible {
-    ($read_space:ty, $write_space:ty) => {
-        impl<'a> VmWriter<'a, $write_space> {
-            /// Writes all data from the reader until one of the three conditions is met:
-            /// 1. The reader has no remaining data.
-            /// 2. The writer has no available space.
-            /// 3. The reader/writer encounters some error.
-            ///
-            /// On success, the number of bytes written is returned;
-            /// On error, both the error and the number of bytes written so far are returned.
-            pub fn write_fallible(
+    ($writer_fallibility:ty, $reader_fallibility:ty) => {
+        impl<'a> FallibleVmWrite<$reader_fallibility> for VmWriter<'a, $writer_fallibility> {
+            fn write_fallible(
                 &mut self,
-                reader: &mut VmReader<'_, $read_space>,
+                reader: &mut VmReader<'_, $reader_fallibility>,
             ) -> core::result::Result<usize, (Error, usize)> {
                 reader.read_fallible(self)
             }
@@ -320,28 +438,26 @@ macro_rules! impl_write_fallible {
     };
 }
 
-// TODO: implement an additional function `memcpy_nonoverlapping_fallible`
-// to implement read/write instruction from user space to user space.
-impl_read_fallible!(UserSpace, KernelSpace);
-impl_read_fallible!(KernelSpace, UserSpace);
-impl_write_fallible!(UserSpace, KernelSpace);
-impl_write_fallible!(KernelSpace, UserSpace);
+impl_read_fallible!(Fallible, Infallible);
+impl_read_fallible!(Fallible, Fallible);
+impl_read_fallible!(Infallible, Fallible);
+impl_write_fallible!(Fallible, Infallible);
+impl_write_fallible!(Fallible, Fallible);
+impl_write_fallible!(Infallible, Fallible);
 
-impl<'a> VmReader<'a, KernelSpace> {
+impl<'a> VmReader<'a, Infallible> {
     /// Constructs a `VmReader` from a pointer and a length, which represents
     /// a memory range in kernel space.
     ///
     /// # Safety
     ///
-    /// Users must ensure the memory from `ptr` to `ptr.add(len)` is contiguous.
-    /// Users must ensure the memory is valid during the entire period of `'a`.
-    /// Users must ensure the memory should _not_ overlap with other `VmWriter`s
-    /// with typed memory, and if the memory range in this `VmReader` is typed,
-    /// it should _not_ overlap with other `VmWriter`s.
-    /// The user space memory is treated as untyped.
+    /// `ptr` must be [valid] for reads of `len` bytes during the entire lifetime `a`.
+    ///
+    /// [valid]: crate::mm::io#safety
     pub unsafe fn from_kernel_space(ptr: *const u8, len: usize) -> Self {
-        // If casting a zero sized slice to a pointer, the pointer may be null
-        // and does not reside in our kernel space range.
+        // Rust is allowed to give the reference to a zero-sized object a very small address,
+        // falling out of the kernel virtual address space range.
+        // So when `len` is zero, we should not and need not to check `ptr`.
         debug_assert!(len == 0 || KERNEL_BASE_VADDR <= ptr as usize);
         debug_assert!(len == 0 || ptr.add(len) as usize <= KERNEL_END_VADDR);
 
@@ -357,16 +473,14 @@ impl<'a> VmReader<'a, KernelSpace> {
     /// 2. The writer has no available space.
     ///
     /// Returns the number of bytes read.
-    pub fn read(&mut self, writer: &mut VmWriter<'_, KernelSpace>) -> usize {
+    pub fn read(&mut self, writer: &mut VmWriter<'_, Infallible>) -> usize {
         let copy_len = self.remain().min(writer.avail());
         if copy_len == 0 {
             return 0;
         }
 
-        // SAFETY: the reading memory range and writing memory range will be valid
-        // since `copy_len` is the minimum of the reader's remaining data and the
-        // writer's available space, and will not overlap if one of them represents
-        // typed memory.
+        // SAFETY: The source and destination are subsets of memory ranges specified by the reader
+        // and writer, so they are valid for reading and writing.
         unsafe {
             memcpy(writer.cursor, self.cursor, copy_len);
             self.cursor = self.cursor.add(copy_len);
@@ -391,17 +505,51 @@ impl<'a> VmReader<'a, KernelSpace> {
         self.read(&mut writer);
         Ok(val)
     }
+
+    /// Reads a value of the `PodOnce` type using one non-tearing memory load.
+    ///
+    /// If the length of the `PodOnce` type exceeds `self.remain()`, this method will return `Err`.
+    ///
+    /// This method will not compile if the `Pod` type is too large for the current architecture
+    /// and the operation must be tear into multiple memory loads.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the current position of the reader does not meet the alignment
+    /// requirements of type `T`.
+    pub fn read_once<T: PodOnce>(&mut self) -> Result<T> {
+        if self.remain() < core::mem::size_of::<T>() {
+            return Err(Error::InvalidArgs);
+        }
+
+        let cursor = self.cursor.cast::<T>();
+        assert!(cursor.is_aligned());
+
+        // SAFETY: We have checked that the number of bytes remaining is at least the size of `T`
+        // and that the cursor is properly aligned with respect to the type `T`. All other safety
+        // requirements are the same as for `Self::read`.
+        let val = unsafe { cursor.read_volatile() };
+        self.cursor = unsafe { self.cursor.add(core::mem::size_of::<T>()) };
+
+        Ok(val)
+    }
+
+    /// Converts to a fallible reader.
+    pub fn to_fallible(self) -> VmReader<'a, Fallible> {
+        // SAFETY: It is safe to transmute to a fallible reader since
+        // 1. the fallibility is a zero-sized marker type,
+        // 2. an infallible reader covers the capabilities of a fallible reader.
+        unsafe { core::mem::transmute(self) }
+    }
 }
 
-impl<'a> VmReader<'a, UserSpace> {
+impl<'a> VmReader<'a, Fallible> {
     /// Constructs a `VmReader` from a pointer and a length, which represents
     /// a memory range in user space.
     ///
     /// # Safety
     ///
-    /// Users must ensure the memory from `ptr` to `ptr.add(len)` is contiguous.
-    /// Users must ensure that the page table for the process in which this constructor is called
-    /// are active during the entire period of `'a`.
+    /// The virtual address range `ptr..ptr + len` must be in user space.
     pub unsafe fn from_user_space(ptr: *const u8, len: usize) -> Self {
         debug_assert!((ptr as usize).checked_add(len).unwrap_or(usize::MAX) <= MAX_USERSPACE_VADDR);
 
@@ -417,6 +565,10 @@ impl<'a> VmReader<'a, UserSpace> {
     /// If the length of the `Pod` type exceeds `self.remain()`,
     /// or the value can not be read completely,
     /// this method will return `Err`.
+    ///
+    /// If the memory read failed, this method will return `Err`
+    /// and the current reader's cursor remains pointing to
+    /// the original starting position.
     pub fn read_val<T: Pod>(&mut self) -> Result<T> {
         if self.remain() < core::mem::size_of::<T>() {
             return Err(Error::InvalidArgs);
@@ -425,12 +577,38 @@ impl<'a> VmReader<'a, UserSpace> {
         let mut val = T::new_uninit();
         let mut writer = VmWriter::from(val.as_bytes_mut());
         self.read_fallible(&mut writer)
-            .map(|_| val)
-            .map_err(|err| err.0)
+            .map_err(|(err, copied_len)| {
+                // SAFETY: The `copied_len` is the number of bytes read so far.
+                // So the `cursor` can be moved back to the original position.
+                unsafe {
+                    self.cursor = self.cursor.sub(copied_len);
+                }
+                err
+            })?;
+        Ok(val)
+    }
+
+    /// Collects all the remaining bytes into a `Vec<u8>`.
+    ///
+    /// If the memory read failed, this method will return `Err`
+    /// and the current reader's cursor remains pointing to
+    /// the original starting position.
+    pub fn collect(&mut self) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; self.remain()];
+        self.read_fallible(&mut buf.as_mut_slice().into())
+            .map_err(|(err, copied_len)| {
+                // SAFETY: The `copied_len` is the number of bytes read so far.
+                // So the `cursor` can be moved back to the original position.
+                unsafe {
+                    self.cursor = self.cursor.sub(copied_len);
+                }
+                err
+            })?;
+        Ok(buf)
     }
 }
 
-impl<'a, Space> VmReader<'a, Space> {
+impl<'a, Fallibility> VmReader<'a, Fallibility> {
     /// Returns the number of bytes for the remaining data.
     pub const fn remain(&self) -> usize {
         // SAFETY: the end is equal to or greater than the cursor.
@@ -461,7 +639,7 @@ impl<'a, Space> VmReader<'a, Space> {
     /// Skips the first `nbytes` bytes of data.
     /// The length of remaining data is decreased accordingly.
     ///
-    /// # Panic
+    /// # Panics
     ///
     /// If `nbytes` is greater than `self.remain()`, then the method panics.
     pub fn skip(mut self, nbytes: usize) -> Self {
@@ -473,12 +651,13 @@ impl<'a, Space> VmReader<'a, Space> {
     }
 }
 
-impl<'a> From<&'a [u8]> for VmReader<'a> {
+impl<'a> From<&'a [u8]> for VmReader<'a, Infallible> {
     fn from(slice: &'a [u8]) -> Self {
-        // SAFETY: the range of memory is contiguous and is valid during `'a`,
-        // and will not overlap with other `VmWriter` since the slice already has
-        // an immutable reference. The slice will not be mapped to the user space hence
-        // it will also not overlap with `VmWriter` generated from user space.
+        // SAFETY:
+        // - The memory range points to typed memory.
+        // - The validity requirements for read accesses are met because the pointer is converted
+        //   from an immutable reference that outlives the lifetime `'a`.
+        // - The type, i.e., the `u8` slice, is plain-old-data.
         unsafe { Self::from_kernel_space(slice.as_ptr(), slice.len()) }
     }
 }
@@ -487,9 +666,10 @@ impl<'a> From<&'a [u8]> for VmReader<'a> {
 ///
 /// The memory range write by `VmWriter` can be in either kernel space or user space.
 /// When the operating range is in kernel space, the memory within that range
-/// is guaranteed to be valid.
+/// is guaranteed to be valid, and the corresponding memory writes are infallible.
 /// When the operating range is in user space, it is ensured that the page table of
-/// the process creating the `VmWriter` is active for the duration of `'a`.
+/// the process creating the `VmWriter` is active for the duration of `'a`,
+/// and the corresponding memory writes are considered fallible.
 ///
 /// When perform writing with a `VmReader`, if one of them represents typed memory,
 /// it can ensure that the writing range in this writer and reading range in the
@@ -499,24 +679,21 @@ impl<'a> From<&'a [u8]> for VmReader<'a> {
 /// and physical address level. There is not guarantee for the operation results
 /// of `VmReader` and `VmWriter` in overlapping untyped addresses, and it is
 /// the user's responsibility to handle this situation.
-pub struct VmWriter<'a, Space = KernelSpace> {
+pub struct VmWriter<'a, Fallibility = Fallible> {
     cursor: *mut u8,
     end: *mut u8,
-    phantom: PhantomData<(&'a mut [u8], Space)>,
+    phantom: PhantomData<(&'a mut [u8], Fallibility)>,
 }
 
-impl<'a> VmWriter<'a, KernelSpace> {
+impl<'a> VmWriter<'a, Infallible> {
     /// Constructs a `VmWriter` from a pointer and a length, which represents
     /// a memory range in kernel space.
     ///
     /// # Safety
     ///
-    /// Users must ensure the memory from `ptr` to `ptr.add(len)` is contiguous.
-    /// Users must ensure the memory is valid during the entire period of `'a`.
-    /// Users must ensure the memory should _not_ overlap with other `VmWriter`s
-    /// and `VmReader`s with typed memory, and if the memory range in this `VmWriter`
-    /// is typed, it should _not_ overlap with other `VmReader`s and `VmWriter`s.
-    /// The user space memory is treated as untyped.
+    /// `ptr` must be [valid] for writes of `len` bytes during the entire lifetime `a`.
+    ///
+    /// [valid]: crate::mm::io#safety
     pub unsafe fn from_kernel_space(ptr: *mut u8, len: usize) -> Self {
         // If casting a zero sized slice to a pointer, the pointer may be null
         // and does not reside in our kernel space range.
@@ -535,7 +712,7 @@ impl<'a> VmWriter<'a, KernelSpace> {
     /// 2. The writer has no available space.
     ///
     /// Returns the number of bytes written.
-    pub fn write(&mut self, reader: &mut VmReader<'_, KernelSpace>) -> usize {
+    pub fn write(&mut self, reader: &mut VmReader<'_, Infallible>) -> usize {
         reader.read(self)
     }
 
@@ -553,11 +730,36 @@ impl<'a> VmWriter<'a, KernelSpace> {
         Ok(())
     }
 
+    /// Writes a value of the `PodOnce` type using one non-tearing memory store.
+    ///
+    /// If the length of the `PodOnce` type exceeds `self.remain()`, this method will return `Err`.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the current position of the writer does not meet the alignment
+    /// requirements of type `T`.
+    pub fn write_once<T: PodOnce>(&mut self, new_val: &T) -> Result<()> {
+        if self.avail() < core::mem::size_of::<T>() {
+            return Err(Error::InvalidArgs);
+        }
+
+        let cursor = self.cursor.cast::<T>();
+        assert!(cursor.is_aligned());
+
+        // SAFETY: We have checked that the number of bytes remaining is at least the size of `T`
+        // and that the cursor is properly aligned with respect to the type `T`. All other safety
+        // requirements are the same as for `Self::writer`.
+        unsafe { cursor.cast::<T>().write_volatile(*new_val) };
+        self.cursor = unsafe { self.cursor.add(core::mem::size_of::<T>()) };
+
+        Ok(())
+    }
+
     /// Fills the available space by repeating `value`.
     ///
     /// Returns the number of values written.
     ///
-    /// # Panic
+    /// # Panics
     ///
     /// The size of the available space must be a multiple of the size of `value`.
     /// Otherwise, the method would panic.
@@ -574,7 +776,7 @@ impl<'a> VmWriter<'a, KernelSpace> {
             // hence the `add` operation and `write` operation are valid and will only manipulate
             // the memory managed by this writer.
             unsafe {
-                (self.cursor as *mut T).add(i).write(value);
+                (self.cursor as *mut T).add(i).write_volatile(value);
             }
         }
 
@@ -582,17 +784,26 @@ impl<'a> VmWriter<'a, KernelSpace> {
         self.cursor = self.end;
         written_num
     }
+
+    /// Converts to a fallible writer.
+    pub fn to_fallible(self) -> VmWriter<'a, Fallible> {
+        // SAFETY: It is safe to transmute to a fallible writer since
+        // 1. the fallibility is a zero-sized marker type,
+        // 2. an infallible reader covers the capabilities of a fallible reader.
+        unsafe { core::mem::transmute(self) }
+    }
 }
 
-impl<'a> VmWriter<'a, UserSpace> {
+impl<'a> VmWriter<'a, Fallible> {
     /// Constructs a `VmWriter` from a pointer and a length, which represents
     /// a memory range in user space.
     ///
+    /// The current context should be consistently associated with valid user space during the
+    /// entire lifetime `'a`. This is for correct semantics and is not a safety requirement.
+    ///
     /// # Safety
     ///
-    /// Users must ensure the memory from `ptr` to `ptr.add(len)` is contiguous.
-    /// Users must ensure that the page table for the process in which this constructor is called
-    /// are active during the entire period of `'a`.
+    /// `ptr` must be in user space for `len` bytes.
     pub unsafe fn from_user_space(ptr: *mut u8, len: usize) -> Self {
         debug_assert!((ptr as usize).checked_add(len).unwrap_or(usize::MAX) <= MAX_USERSPACE_VADDR);
 
@@ -608,18 +819,58 @@ impl<'a> VmWriter<'a, UserSpace> {
     /// If the length of the `Pod` type exceeds `self.avail()`,
     /// or the value can not be write completely,
     /// this method will return `Err`.
+    ///
+    /// If the memory write failed, this method will return `Err`
+    /// and the current writer's cursor remains pointing to
+    /// the original starting position.
     pub fn write_val<T: Pod>(&mut self, new_val: &T) -> Result<()> {
         if self.avail() < core::mem::size_of::<T>() {
             return Err(Error::InvalidArgs);
         }
 
         let mut reader = VmReader::from(new_val.as_bytes());
-        self.write_fallible(&mut reader).map_err(|err| err.0)?;
+        self.write_fallible(&mut reader)
+            .map_err(|(err, copied_len)| {
+                // SAFETY: The `copied_len` is the number of bytes written so far.
+                // So the `cursor` can be moved back to the original position.
+                unsafe {
+                    self.cursor = self.cursor.sub(copied_len);
+                }
+                err
+            })?;
         Ok(())
+    }
+
+    /// Writes `len` zeros to the target memory.
+    ///
+    /// This method attempts to fill up to `len` bytes with zeros. If the available
+    /// memory from the current cursor position is less than `len`, it will only fill
+    /// the available space.
+    ///
+    /// If the memory write failed due to an unresolvable page fault, this method
+    /// will return `Err` with the length set so far.
+    pub fn fill_zeros(&mut self, len: usize) -> core::result::Result<usize, (Error, usize)> {
+        let len_to_set = self.avail().min(len);
+        if len_to_set == 0 {
+            return Ok(0);
+        }
+
+        // SAFETY: The destination is a subset of the memory range specified by
+        // the current writer, so it is either valid for writing or in user space.
+        let set_len = unsafe {
+            let set_len = memset_fallible(self.cursor, 0u8, len_to_set);
+            self.cursor = self.cursor.add(set_len);
+            set_len
+        };
+        if set_len < len_to_set {
+            Err((Error::PageFault, set_len))
+        } else {
+            Ok(len_to_set)
+        }
     }
 }
 
-impl<'a, Space> VmWriter<'a, Space> {
+impl<'a, Fallibility> VmWriter<'a, Fallibility> {
     /// Returns the number of bytes for the available space.
     pub const fn avail(&self) -> usize {
         // SAFETY: the end is equal to or greater than the cursor.
@@ -650,7 +901,7 @@ impl<'a, Space> VmWriter<'a, Space> {
     /// Skips the first `nbytes` bytes of data.
     /// The length of available space is decreased accordingly.
     ///
-    /// # Panic
+    /// # Panics
     ///
     /// If `nbytes` is greater than `self.avail()`, then the method panics.
     pub fn skip(mut self, nbytes: usize) -> Self {
@@ -662,13 +913,33 @@ impl<'a, Space> VmWriter<'a, Space> {
     }
 }
 
-impl<'a> From<&'a mut [u8]> for VmWriter<'a> {
+impl<'a> From<&'a mut [u8]> for VmWriter<'a, Infallible> {
     fn from(slice: &'a mut [u8]) -> Self {
-        // SAFETY: the range of memory is contiguous and is valid during `'a`, and
-        // will not overlap with other `VmWriter`s and `VmReader`s since the slice
-        // already has an mutable reference. The slice will not be mapped to the user
-        // space hence it will also not overlap with `VmWriter`s and `VmReader`s
-        // generated from user space.
+        // SAFETY:
+        // - The memory range points to typed memory.
+        // - The validity requirements for write accesses are met because the pointer is converted
+        //   from a mutable reference that outlives the lifetime `'a`.
+        // - The type, i.e., the `u8` slice, is plain-old-data.
         unsafe { Self::from_kernel_space(slice.as_mut_ptr(), slice.len()) }
     }
+}
+
+/// A marker trait for POD types that can be read or written with one instruction.
+///
+/// We currently rely on this trait to ensure that the memory operation created by
+/// `ptr::read_volatile` and `ptr::write_volatile` doesn't tear. However, the Rust documentation
+/// makes no such guarantee, and even the wording in the LLVM LangRef is ambiguous.
+///
+/// At this point, we can only _hope_ that this doesn't break in future versions of the Rust or
+/// LLVM compilers. However, this is unlikely to happen in practice, since the Linux kernel also
+/// uses "volatile" semantics to implement `READ_ONCE`/`WRITE_ONCE`.
+pub trait PodOnce: Pod {}
+
+impl<T: Pod> PodOnce for T where Assert<{ is_pod_once::<T>() }>: IsTrue {}
+
+#[cfg(target_arch = "x86_64")]
+const fn is_pod_once<T: Pod>() -> bool {
+    let size = size_of::<T>();
+
+    size == 1 || size == 2 || size == 4 || size == 8
 }

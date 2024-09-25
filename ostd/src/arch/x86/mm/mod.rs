@@ -5,7 +5,8 @@
 use alloc::fmt;
 use core::ops::Range;
 
-pub(crate) use util::__memcpy_fallible;
+use cfg_if::cfg_if;
+pub(crate) use util::{__memcpy_fallible, __memset_fallible};
 use x86_64::{instructions::tlb, structures::paging::PhysFrame, VirtAddr};
 
 use crate::{
@@ -58,7 +59,7 @@ bitflags::bitflags! {
         /// the TLB on an address space switch.
         const GLOBAL =          1 << 8;
         /// TDX shared bit.
-        #[cfg(feature = "intel_tdx")]
+        #[cfg(feature = "cvm_guest")]
         const SHARED =          1 << 51;
         /// Forbid execute codes on the page. The NXE bits in EFER msr must be set.
         const NO_EXECUTE =      1 << 63;
@@ -129,18 +130,20 @@ pub unsafe fn activate_page_table(root_paddr: Paddr, root_pt_cache: CachePolicy)
 }
 
 pub fn current_page_table_paddr() -> Paddr {
-    x86_64::registers::control::Cr3::read()
+    x86_64::registers::control::Cr3::read_raw()
         .0
         .start_address()
         .as_u64() as Paddr
 }
 
 impl PageTableEntry {
-    /// 51:12
-    #[cfg(not(feature = "intel_tdx"))]
-    const PHYS_ADDR_MASK: usize = 0xF_FFFF_FFFF_F000;
-    #[cfg(feature = "intel_tdx")]
-    const PHYS_ADDR_MASK: usize = 0x7_FFFF_FFFF_F000;
+    cfg_if! {
+        if #[cfg(feature = "cvm_guest")] {
+            const PHYS_ADDR_MASK: usize = 0x7_FFFF_FFFF_F000;
+        } else {
+            const PHYS_ADDR_MASK: usize = 0xF_FFFF_FFFF_F000;
+        }
+    }
     const PROP_MASK: usize = !Self::PHYS_ADDR_MASK & !PageTableFlags::HUGE.bits();
 }
 
@@ -188,7 +191,7 @@ impl PageTableEntryTrait for PageTableEntry {
             | parse_flags!(self.0, PageTableFlags::DIRTY, PageFlags::DIRTY);
         let priv_flags = parse_flags!(self.0, PageTableFlags::USER, PrivFlags::USER)
             | parse_flags!(self.0, PageTableFlags::GLOBAL, PrivFlags::GLOBAL);
-        #[cfg(feature = "intel_tdx")]
+        #[cfg(feature = "cvm_guest")]
         let priv_flags =
             priv_flags | parse_flags!(self.0, PageTableFlags::SHARED, PrivFlags::SHARED);
         let cache = if self.0 & PageTableFlags::NO_CACHE.bits() != 0 {
@@ -225,7 +228,7 @@ impl PageTableEntryTrait for PageTableEntry {
                 PrivFlags::GLOBAL,
                 PageTableFlags::GLOBAL
             );
-        #[cfg(feature = "intel_tdx")]
+        #[cfg(feature = "cvm_guest")]
         {
             flags |= parse_flags!(
                 prop.priv_flags.bits(),

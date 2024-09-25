@@ -53,15 +53,15 @@ impl SocketDevice {
         let virtio_vsock_config = VirtioVsockConfig::new(transport.as_mut());
         debug!("virtio_vsock_config = {:?}", virtio_vsock_config);
         let guest_cid = field_ptr!(&virtio_vsock_config, VirtioVsockConfig, guest_cid_low)
-            .read()
+            .read_once()
             .unwrap() as u64
             | (field_ptr!(&virtio_vsock_config, VirtioVsockConfig, guest_cid_high)
-                .read()
+                .read_once()
                 .unwrap() as u64)
                 << 32;
 
         let mut recv_queue = VirtQueue::new(QUEUE_RECV, QUEUE_SIZE, transport.as_mut())
-            .expect("createing recv queue fails");
+            .expect("creating recv queue fails");
         let send_queue = VirtQueue::new(QUEUE_SEND, QUEUE_SIZE, transport.as_mut())
             .expect("creating send queue fails");
         let event_queue = VirtQueue::new(QUEUE_EVENT, QUEUE_SIZE, transport.as_mut())
@@ -83,7 +83,7 @@ impl SocketDevice {
         }
 
         let mut device = Self {
-            config: virtio_vsock_config.read().unwrap(),
+            config: virtio_vsock_config.read_once().unwrap(),
             guest_cid,
             send_queue,
             recv_queue,

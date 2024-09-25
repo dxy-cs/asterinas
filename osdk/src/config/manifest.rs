@@ -12,7 +12,7 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 
 use super::scheme::Scheme;
 
-use crate::{config::scheme::QemuScheme, error::Errno, error_msg, util::get_cargo_metadata};
+use crate::{error::Errno, error_msg, util::get_cargo_metadata};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OsdkMeta {
@@ -50,60 +50,33 @@ impl TomlManifest {
                     .unwrap(),
             )
         };
-        // All the custom schemes should inherit settings from the default scheme, this is a helper.
-        fn finalize(current_manifest: Option<TomlManifest>) -> TomlManifest {
-            let Some(mut current_manifest) = current_manifest else {
-                error_msg!(
-                    "Cannot find `OSDK.toml` in the current directory or the workspace root"
-                );
-                process::exit(Errno::GetMetadata as _);
-            };
-            for scheme in current_manifest.map.values_mut() {
-                scheme.inherit(&current_manifest.default_scheme);
-            }
-            current_manifest
-        }
 
         // Search for OSDK.toml in the current directory first.
-        let current_manifest_path = PathBuf::from("OSDK.toml").canonicalize().ok();
-        let mut current_manifest = match &current_manifest_path {
-            Some(path) => deserialize_toml_manifest(path),
-            None => None,
-        };
-        // Then search in the workspace root.
-        let workspace_manifest_path = workspace_root.join("OSDK.toml").canonicalize().ok();
-        // The case that the current directory is also the workspace root.
-        if let Some(current) = &current_manifest_path {
-            if let Some(workspace) = &workspace_manifest_path {
-                if current == workspace {
-                    return finalize(current_manifest);
+        let current_manifest_path = PathBuf::from("OSDK.toml").canonicalize();
+        let current_manifest = match &current_manifest_path {
+            Ok(path) => deserialize_toml_manifest(path),
+            Err(_) => {
+                // If not found, search in the workspace root.
+                if let Ok(workspace_manifest_path) = workspace_root.join("OSDK.toml").canonicalize()
+                {
+                    deserialize_toml_manifest(workspace_manifest_path)
+                } else {
+                    None
                 }
             }
-        }
-        let workspace_manifest = match workspace_manifest_path {
-            Some(path) => deserialize_toml_manifest(path),
-            None => None,
         };
-        // The current manifest should inherit settings from the workspace manifest.
-        if let Some(workspace_manifest) = workspace_manifest {
-            if current_manifest.is_none() {
-                current_manifest = Some(workspace_manifest);
-            } else {
-                // Inherit one scheme at a time.
-                let current_manifest = current_manifest.as_mut().unwrap();
-                current_manifest
-                    .default_scheme
-                    .inherit(&workspace_manifest.default_scheme);
-                for (scheme_string, scheme) in workspace_manifest.map {
-                    let current_scheme = current_manifest
-                        .map
-                        .entry(scheme_string)
-                        .or_insert_with(Scheme::empty);
-                    current_scheme.inherit(&scheme);
-                }
-            }
+
+        let Some(mut current_manifest) = current_manifest else {
+            error_msg!("Cannot find `OSDK.toml` in the current directory or the workspace root");
+            process::exit(Errno::GetMetadata as _);
+        };
+
+        // All the schemes should inherit from the default scheme.
+        for scheme in current_manifest.map.values_mut() {
+            scheme.inherit(&current_manifest.default_scheme);
         }
-        finalize(current_manifest)
+
+        current_manifest
     }
 
     /// Get the scheme given the scheme from the command line arguments.
@@ -155,82 +128,7 @@ fn deserialize_toml_manifest(path: impl AsRef<Path>) -> Option<TomlManifest> {
     for scheme in manifest.map.values_mut() {
         scheme.work_dir = Some(cwd.to_path_buf());
     }
-    // Canonicalize all the path fields
-    let canonicalize = |target: &mut PathBuf| {
-        let last_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(cwd).unwrap();
-        *target = target.canonicalize().unwrap_or_else(|err| {
-            error_msg!(
-                "Cannot canonicalize path `{}`: {}",
-                target.to_string_lossy(),
-                err,
-            );
-            std::env::set_current_dir(&last_cwd).unwrap();
-            process::exit(Errno::GetMetadata as _);
-        });
-        std::env::set_current_dir(last_cwd).unwrap();
-    };
-    let canonicalize_scheme = |scheme: &mut Scheme| {
-        macro_rules! canonicalize_paths_in_scheme {
-            ($scheme:expr) => {
-                if let Some(ref mut boot) = $scheme.boot {
-                    if let Some(ref mut initramfs) = boot.initramfs {
-                        canonicalize(initramfs);
-                    }
-                }
-                if let Some(ref mut qemu) = $scheme.qemu {
-                    if let Some(ref mut qemu_path) = qemu.path {
-                        canonicalize(qemu_path);
-                    }
-                }
-                if let Some(ref mut grub) = $scheme.grub {
-                    if let Some(ref mut grub_mkrescue_path) = grub.grub_mkrescue {
-                        canonicalize(grub_mkrescue_path);
-                    }
-                }
-            };
-        }
-        canonicalize_paths_in_scheme!(scheme);
-        if let Some(ref mut run) = scheme.run {
-            canonicalize_paths_in_scheme!(run);
-        }
-        if let Some(ref mut test) = scheme.test {
-            canonicalize_paths_in_scheme!(test);
-        }
-    };
-    canonicalize_scheme(&mut manifest.default_scheme);
-    for scheme in manifest.map.values_mut() {
-        canonicalize_scheme(scheme);
-    }
-    // Do evaluations on the need to be evaluated string field, namely,
-    // QEMU arguments.
-    use super::eval::eval;
-    let eval_scheme = |scheme: &mut Scheme| {
-        let eval_qemu = |qemu: &mut Option<QemuScheme>| {
-            if let Some(ref mut qemu) = qemu {
-                if let Some(ref mut args) = qemu.args {
-                    *args = match eval(cwd, args) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error_msg!("Failed to evaluate qemu args: {:#?}", e);
-                            process::exit(Errno::ParseMetadata as _);
-                        }
-                    }
-                }
-            }
-        };
-        eval_qemu(&mut scheme.qemu);
-        if let Some(ref mut run) = scheme.run {
-            eval_qemu(&mut run.qemu);
-        }
-        if let Some(ref mut test) = scheme.test {
-            eval_qemu(&mut test.qemu);
-        }
-    };
-    eval_scheme(&mut manifest.default_scheme);
-    for scheme in manifest.map.values_mut() {
-        eval_scheme(scheme);
-    }
+
     Some(manifest)
 }
 

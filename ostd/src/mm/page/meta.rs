@@ -2,12 +2,12 @@
 
 //! Metadata management of pages.
 //!
-//! You can picture a globally shared, static, gigantic arrary of metadata initialized for each page.
+//! You can picture a globally shared, static, gigantic array of metadata initialized for each page.
 //! An entry in the array is called a `MetaSlot`, which contains the metadata of a page. There would
 //! be a dedicated small "heap" space in each slot for dynamic metadata. You can store anything as the
 //! metadata of a page as long as it's [`Sync`].
 //!
-//! In the implemetation level, the slots are placed in the metadata pages mapped to a certain virtual
+//! In the implementation level, the slots are placed in the metadata pages mapped to a certain virtual
 //! address. It is faster, simpler, safer and more versatile compared with an actual static array
 //! implementation.
 
@@ -52,7 +52,8 @@ use super::{allocator, Page};
 use crate::{
     arch::mm::{PageTableEntry, PagingConsts},
     mm::{
-        kspace::BOOT_PAGE_TABLE, paddr_to_vaddr, page_size, page_table::PageTableEntryTrait,
+        paddr_to_vaddr, page_size,
+        page_table::{boot_pt, PageTableEntryTrait},
         CachePolicy, Paddr, PageFlags, PageProperty, PagingConstsTrait, PagingLevel,
         PrivilegedPageFlags, Vaddr, PAGE_SIZE,
     },
@@ -268,20 +269,19 @@ pub(crate) fn init() -> Vec<Page<MetaPageMeta>> {
     let num_meta_pages = (num_pages * size_of::<MetaSlot>()).div_ceil(PAGE_SIZE);
     let meta_pages = alloc_meta_pages(num_meta_pages);
     // Map the metadata pages.
-    let mut boot_pt_lock = BOOT_PAGE_TABLE.lock();
-    let boot_pt = boot_pt_lock
-        .as_mut()
-        .expect("boot page table not initialized");
-    for (i, frame_paddr) in meta_pages.iter().enumerate() {
-        let vaddr = mapping::page_to_meta::<PagingConsts>(0) + i * PAGE_SIZE;
-        let prop = PageProperty {
-            flags: PageFlags::RW,
-            cache: CachePolicy::Writeback,
-            priv_flags: PrivilegedPageFlags::GLOBAL,
-        };
-        // SAFETY: we are doing the metadata mappings for the kernel.
-        unsafe { boot_pt.map_base_page(vaddr, frame_paddr / PAGE_SIZE, prop) };
-    }
+    boot_pt::with_borrow(|boot_pt| {
+        for (i, frame_paddr) in meta_pages.iter().enumerate() {
+            let vaddr = mapping::page_to_meta::<PagingConsts>(0) + i * PAGE_SIZE;
+            let prop = PageProperty {
+                flags: PageFlags::RW,
+                cache: CachePolicy::Writeback,
+                priv_flags: PrivilegedPageFlags::GLOBAL,
+            };
+            // SAFETY: we are doing the metadata mappings for the kernel.
+            unsafe { boot_pt.map_base_page(vaddr, frame_paddr / PAGE_SIZE, prop) };
+        }
+    })
+    .unwrap();
     // Now the metadata pages are mapped, we can initialize the metadata.
     meta_pages
         .into_iter()

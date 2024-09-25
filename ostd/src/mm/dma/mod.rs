@@ -11,9 +11,9 @@ use inherit_methods_macro::inherit_methods;
 use spin::Once;
 
 use super::Paddr;
-use crate::{arch::iommu::has_iommu, mm::PAGE_SIZE, sync::SpinLock};
+use crate::{arch::iommu::has_dma_remapping, mm::PAGE_SIZE, sync::SpinLock};
 
-/// The devide address.
+/// The device address.
 ///
 /// If a device performs DMA to read or write system
 /// memory, the addresses used by the device are device addresses.
@@ -49,7 +49,7 @@ impl<T: HasDaddr> HasDaddr for &T {
 static DMA_MAPPING_SET: Once<SpinLock<BTreeSet<Paddr>>> = Once::new();
 
 pub fn dma_type() -> DmaType {
-    if has_iommu() {
+    if has_dma_remapping() {
         DmaType::Iommu
     } else {
         DmaType::Direct
@@ -63,7 +63,7 @@ pub fn init() {
 /// Checks whether the physical addresses has dma mapping.
 /// Fail if they have been mapped, otherwise insert them.
 fn check_and_insert_dma_mapping(start_paddr: Paddr, num_pages: usize) -> bool {
-    let mut mapping_set = DMA_MAPPING_SET.get().unwrap().lock_irq_disabled();
+    let mut mapping_set = DMA_MAPPING_SET.get().unwrap().disable_irq().lock();
     // Ensure that the addresses used later will not overflow
     start_paddr.checked_add(num_pages * PAGE_SIZE).unwrap();
     for i in 0..num_pages {
@@ -81,7 +81,7 @@ fn check_and_insert_dma_mapping(start_paddr: Paddr, num_pages: usize) -> bool {
 
 /// Removes a physical address from the dma mapping set.
 fn remove_dma_mapping(start_paddr: Paddr, num_pages: usize) {
-    let mut mapping_set = DMA_MAPPING_SET.get().unwrap().lock_irq_disabled();
+    let mut mapping_set = DMA_MAPPING_SET.get().unwrap().disable_irq().lock();
     // Ensure that the addresses used later will not overflow
     start_paddr.checked_add(num_pages * PAGE_SIZE).unwrap();
     for i in 0..num_pages {

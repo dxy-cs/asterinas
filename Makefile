@@ -15,6 +15,7 @@ RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
 SCHEME ?= ""
 SMP ?= 1
+OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
 # End of global options.
 
 # The Makefile provides a way to run arbitrary tests in the kernel
@@ -35,6 +36,9 @@ CARGO_OSDK_ARGS += --kcmd-args="SYSCALL_TEST_DIR=$(SYSCALL_TEST_DIR)"
 CARGO_OSDK_ARGS += --kcmd-args="EXTRA_BLOCKLISTS_DIRS=$(EXTRA_BLOCKLISTS_DIRS)"
 CARGO_OSDK_ARGS += --init-args="/opt/syscall_test/run_syscall_test.sh"
 else ifeq ($(AUTO_TEST), test)
+	ifneq ($(SMP), 1)
+		CARGO_OSDK_ARGS += --kcmd-args="BLOCK_UNSUPPORTED_SMP_TESTS=1"
+	endif
 CARGO_OSDK_ARGS += --init-args="/test/run_general_test.sh"
 else ifeq ($(AUTO_TEST), boot)
 CARGO_OSDK_ARGS += --init-args="/test/boot_hello.sh"
@@ -43,22 +47,25 @@ export VSOCK=1
 CARGO_OSDK_ARGS += --init-args="/test/run_vsock_test.sh"
 endif
 
-# If the BENCHMARK is set, we will run the benchmark in the kernel mode.
-ifneq ($(BENCHMARK), none)
-CARGO_OSDK_ARGS += --init-args="/benchmark/$(BENCHMARK)/run.sh"
-endif
-
 ifeq ($(RELEASE_LTO), 1)
 CARGO_OSDK_ARGS += --profile release-lto
+OSTD_TASK_STACK_SIZE_IN_PAGES = 8
 else ifeq ($(RELEASE), 1)
 CARGO_OSDK_ARGS += --release
+OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+endif
+
+# If the BENCHMARK is set, we will run the benchmark in the kernel mode.
+ifneq ($(BENCHMARK), none)
+CARGO_OSDK_ARGS += --init-args="/benchmark/common/bench_runner.sh $(BENCHMARK) asterinas"
+# TODO: remove this workaround after enabling kernel virtual area.
+OSTD_TASK_STACK_SIZE_IN_PAGES = 7
 endif
 
 ifeq ($(INTEL_TDX), 1)
 BOOT_METHOD = grub-qcow2
 BOOT_PROTOCOL = linux-efi-handover64
 CARGO_OSDK_ARGS += --scheme tdx
-CARGO_OSDK_ARGS += --features intel_tdx
 endif
 
 ifneq ($(SCHEME), "")
@@ -108,10 +115,10 @@ NON_OSDK_CRATES := \
 # In contrast, OSDK crates depend on OSTD (or being `ostd` itself)
 # and need to be built or tested with OSDK.
 OSDK_CRATES := \
+	osdk/test-kernel \
 	ostd \
 	ostd/libs/linux-bzimage/setup \
 	kernel \
-	kernel/aster-nix \
 	kernel/comps/block \
 	kernel/comps/console \
 	kernel/comps/framebuffer \
@@ -119,7 +126,8 @@ OSDK_CRATES := \
 	kernel/comps/network \
 	kernel/comps/time \
 	kernel/comps/virtio \
-	kernel/libs/aster-util
+	kernel/libs/aster-util \
+	kernel/libs/aster-bigtcp
 
 .PHONY: all
 all: build
@@ -128,12 +136,25 @@ all: build
 # To uninstall, do `cargo uninstall cargo-osdk`
 .PHONY: install_osdk
 install_osdk:
-	@cargo install cargo-osdk --path osdk
+	@# The `OSDK_LOCAL_DEV` environment variable is used for local development
+	@# without the need to publish the changes of OSDK's self-hosted
+	@# dependencies to `crates.io`.
+	@OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk
 
 # This will install OSDK if it is not already installed
 # To update OSDK, we need to run `install_osdk` manually
 $(CARGO_OSDK):
 	@make --no-print-directory install_osdk
+
+.PHONY: check_osdk
+check_osdk:
+	@cd osdk && cargo clippy -- -D warnings
+
+.PHONY: test_osdk
+test_osdk:
+	@cd osdk && \
+		OSDK_LOCAL_DEV=1 cargo build && \
+		OSDK_LOCAL_DEV=1 cargo test
 
 .PHONY: initramfs
 initramfs:
@@ -148,7 +169,7 @@ tools:
 	@cd kernel/libs/comp-sys && cargo install --path cargo-component
 
 .PHONY: run
-run: build
+run: initramfs $(CARGO_OSDK)
 	@cargo osdk run $(CARGO_OSDK_ARGS)
 # Check the running status of auto tests from the QEMU log
 ifeq ($(AUTO_TEST), syscall)
@@ -204,7 +225,7 @@ format:
 	@make --no-print-directory -C test format
 
 .PHONY: check
-check: $(CARGO_OSDK)
+check: initramfs $(CARGO_OSDK)
 	@./tools/format_all.sh --check   	# Check Rust format issues
 	@# Check if STD_CRATES and NOSTD_CRATES combined is the same as all workspace members
 	@sed -n '/^\[workspace\]/,/^\[.*\]/{/members = \[/,/\]/p}' Cargo.toml | \
@@ -224,14 +245,17 @@ check: $(CARGO_OSDK)
 		(cd $$dir && cargo osdk clippy -- -- -D warnings) || exit 1; \
 	done
 	@make --no-print-directory -C test check
-
-.PHONY: check_osdk
-check_osdk:
-	@cd osdk && cargo clippy -- -D warnings
+	@typos
 
 .PHONY: clean
 clean:
+	@echo "Cleaning up Asterinas workspace target files"
 	@cargo clean
+	@echo "Cleaning up OSDK workspace target files"
+	@cd osdk && cargo clean
+	@echo "Cleaning up documentation target files"
 	@cd docs && mdbook clean
+	@echo "Cleaning up test target files"
 	@make --no-print-directory -C test clean
+	@echo "Uninstalling OSDK"
 	@rm -f $(CARGO_OSDK)

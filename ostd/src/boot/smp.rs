@@ -15,7 +15,6 @@ use crate::{
         page::{self, meta::KernelMeta, ContPages},
         PAGE_SIZE,
     },
-    trap,
 };
 
 pub(crate) static AP_BOOT_INFO: Once<ApBootInfo> = Once::new();
@@ -113,12 +112,30 @@ pub fn register_ap_entry(entry: fn() -> !) {
 fn ap_early_entry(local_apic_id: u32) -> ! {
     crate::arch::enable_cpu_features();
 
-    // SAFETY: we are on the AP.
+    // SAFETY: we are on the AP and they are only called once with the correct
+    // CPU ID.
     unsafe {
-        cpu::cpu_local::init_on_ap(local_apic_id);
+        cpu::local::init_on_ap(local_apic_id);
+        cpu::set_this_cpu_id(local_apic_id);
     }
 
-    trap::init();
+    // SAFETY: this function is only called once on this AP.
+    unsafe {
+        crate::arch::trap::init(false);
+    }
+
+    // SAFETY: this function is only called once on this AP, after the BSP has
+    // done the architecture-specific initialization.
+    unsafe {
+        crate::arch::init_on_ap();
+    }
+
+    crate::arch::irq::enable_local();
+
+    // SAFETY: this function is only called once on this AP.
+    unsafe {
+        crate::mm::kspace::activate_kernel_page_table();
+    }
 
     // Mark the AP as started.
     let ap_boot_info = AP_BOOT_INFO.get().unwrap();

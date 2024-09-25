@@ -154,6 +154,47 @@ FN_TEST(bind)
 }
 END_TEST()
 
+FN_TEST(bind_reuseaddr)
+{
+	sk_addr.sin_port = htons(8081);
+	struct sockaddr *psaddr = (struct sockaddr *)&sk_addr;
+	socklen_t addrlen = sizeof(sk_addr);
+
+	int disable = 0;
+	int enable = 1;
+	int sk1 = TEST_SUCC(socket(PF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+	int sk2 = TEST_SUCC(socket(PF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+
+	TEST_SUCC(bind(sk1, psaddr, addrlen));
+
+	TEST_ERRNO(bind(sk2, psaddr, addrlen), EADDRINUSE);
+
+	// FIXME: The test will fail in Asterinas since it doesn't check
+	// if the previous socket was bound with `SO_REUSEADDR`
+	//
+	// TEST_SUCC(setsockopt(sk1, SOL_SOCKET, SO_REUSEADDR, &disable,
+	// 		     sizeof(disable)));
+	// TEST_SUCC(setsockopt(sk2, SOL_SOCKET, SO_REUSEADDR, &enable,
+	// 		     sizeof(enable)));
+	// TEST_ERRNO(bind(sk2, psaddr, addrlen), EADDRINUSE);
+
+	TEST_SUCC(setsockopt(sk1, SOL_SOCKET, SO_REUSEADDR, &enable,
+			     sizeof(enable)));
+	TEST_SUCC(setsockopt(sk2, SOL_SOCKET, SO_REUSEADDR, &disable,
+			     sizeof(disable)));
+	TEST_ERRNO(bind(sk2, psaddr, addrlen), EADDRINUSE);
+
+	TEST_SUCC(setsockopt(sk1, SOL_SOCKET, SO_REUSEADDR, &enable,
+			     sizeof(enable)));
+	TEST_SUCC(setsockopt(sk2, SOL_SOCKET, SO_REUSEADDR, &enable,
+			     sizeof(enable)));
+	TEST_SUCC(bind(sk2, psaddr, addrlen));
+
+	TEST_SUCC(close(sk1));
+	TEST_SUCC(close(sk2));
+}
+END_TEST()
+
 FN_TEST(listen)
 {
 	TEST_ERRNO(listen(sk_unbound, 2), EOPNOTSUPP);
@@ -235,7 +276,8 @@ FN_TEST(sendmsg_and_recvmsg)
 	msg.msg_name = (struct sockaddr *)&sk_addr;
 	msg.msg_namelen = addrlen;
 
-	// Send one message and receive one message
+	// TEST CASE 1: Send one message and receive one message
+
 	TEST_RES(sendmsg(sk_connected, &msg, 0), _ret == strlen(message));
 
 #define BUFFER_SIZE 50
@@ -246,7 +288,8 @@ FN_TEST(sendmsg_and_recvmsg)
 	TEST_RES(recvmsg(sk_bound, &msg, 0),
 		 _ret == strlen(message) && strcmp(message, buffer) == 0);
 
-	// Send two messages and receive two messages
+	// TEST CASE 2: Send two messages and receive two messages
+
 	iov[0].iov_base = message;
 	iov[0].iov_len = strlen(message);
 	msg.msg_name = (struct sockaddr *)&sk_addr;
@@ -262,5 +305,82 @@ FN_TEST(sendmsg_and_recvmsg)
 		 _ret == strlen(message) && strcmp(message, buffer) == 0);
 	TEST_RES(recvmsg(sk_bound, &msg, 0),
 		 _ret == strlen(message) && strcmp(message, buffer) == 0);
+}
+END_TEST()
+
+void set_nonblocking(int sockfd)
+{
+	int flags = CHECK(fcntl(sockfd, F_GETFL, 0));
+	CHECK(fcntl(sockfd, F_SETFL, flags | O_NONBLOCK));
+}
+
+FN_SETUP(enter_nonblocking_mode)
+{
+	set_nonblocking(sk_connected);
+	set_nonblocking(sk_bound);
+}
+END_SETUP()
+
+FN_TEST(sendmsg_and_recvmsg_bad_buffer)
+{
+	struct sockaddr_in saddr;
+	socklen_t addrlen = sizeof(saddr);
+
+	sk_addr.sin_port = C_PORT;
+
+	struct msghdr msg = { 0 };
+	struct iovec iov[2];
+	msg.msg_name = (struct sockaddr *)&sk_addr;
+	msg.msg_namelen = addrlen;
+
+	// TEST CASE 1: Send via a partially bad send buffer
+
+	char *good_buffer = "abc";
+	char *bad_buffer = (char *)1;
+	iov[0].iov_base = good_buffer;
+	iov[0].iov_len = strlen(good_buffer);
+	iov[1].iov_base = bad_buffer;
+	iov[1].iov_len = 1;
+	msg.msg_iov = iov;
+	msg.msg_iovlen = 2;
+	TEST_ERRNO(sendmsg(sk_connected, &msg, 0), EFAULT);
+
+	// TEST CASE 2: Receive via a partially bad receive buffer
+
+	iov[0].iov_base = good_buffer;
+	iov[0].iov_len = strlen(good_buffer);
+	msg.msg_iov = iov;
+	msg.msg_iovlen = 1;
+
+	TEST_RES(sendmsg(sk_connected, &msg, 0), _ret == strlen(good_buffer));
+	TEST_RES(sendmsg(sk_connected, &msg, 0), _ret == strlen(good_buffer));
+	TEST_RES(sendmsg(sk_connected, &msg, 0), _ret == strlen(good_buffer));
+	TEST_RES(sendmsg(sk_connected, &msg, 0), _ret == strlen(good_buffer));
+
+	sleep(1);
+
+	char recv_buffer[4096] = { 0 };
+	iov[0].iov_base = recv_buffer;
+	iov[0].iov_len = 1;
+	TEST_RES(recvmsg(sk_bound, &msg, 0), _ret == 1);
+
+	iov[0].iov_base = recv_buffer;
+	iov[0].iov_len = 1;
+	iov[1].iov_base = (char *)1;
+	iov[1].iov_len = 1;
+	msg.msg_iovlen = 2;
+	TEST_ERRNO(recvmsg(sk_bound, &msg, 0), EFAULT);
+
+	iov[0].iov_base = recv_buffer;
+	iov[0].iov_len = 4096;
+	msg.msg_iovlen = 1;
+	TEST_RES(recvmsg(sk_bound, &msg, 0), _ret == strlen(good_buffer));
+
+	iov[0].iov_base = recv_buffer;
+	iov[0].iov_len = 4096;
+	iov[1].iov_base = (char *)1;
+	iov[1].iov_len = 1;
+	msg.msg_iovlen = 2;
+	TEST_RES(recvmsg(sk_bound, &msg, 0), _ret == strlen(good_buffer));
 }
 END_TEST()

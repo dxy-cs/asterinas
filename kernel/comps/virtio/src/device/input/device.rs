@@ -122,7 +122,7 @@ impl InputDevice {
         let input_prop = InputProp::from_bits(prop[0]).unwrap();
         debug!("input device prop:{:?}", input_prop);
 
-        let mut transport = device.transport.lock_irq_disabled();
+        let mut transport = device.transport.disable_irq().lock();
         fn config_space_change(_: &TrapFrame) {
             debug!("input device config space change");
         }
@@ -148,7 +148,7 @@ impl InputDevice {
 
     /// Pop the pending event.
     fn pop_pending_events(&self, handle_event: &impl Fn(&EventBuf) -> bool) {
-        let mut event_queue = self.event_queue.lock_irq_disabled();
+        let mut event_queue = self.event_queue.disable_irq().lock();
 
         // one interrupt may contain several input events, so it should loop
         while let Ok((token, _)) = event_queue.pop_used() {
@@ -171,15 +171,17 @@ impl InputDevice {
     /// result to `out`, return the result size.
     pub fn query_config_select(&self, select: InputConfigSelect, subsel: u8, out: &mut [u8]) -> u8 {
         field_ptr!(&self.config, VirtioInputConfig, select)
-            .write(&(select as u8))
+            .write_once(&(select as u8))
             .unwrap();
         field_ptr!(&self.config, VirtioInputConfig, subsel)
-            .write(&subsel)
+            .write_once(&subsel)
             .unwrap();
         let size = field_ptr!(&self.config, VirtioInputConfig, size)
-            .read()
+            .read_once()
             .unwrap();
         let data: [u8; 128] = field_ptr!(&self.config, VirtioInputConfig, data)
+            // FIXME: It is impossible to call `read_once` on `[u8; 128]`. What's the proper way to
+            // read this field out?
             .read()
             .unwrap();
         out[..size as usize].copy_from_slice(&data[..size as usize]);
@@ -188,7 +190,7 @@ impl InputDevice {
 
     fn handle_irq(&self) {
         let callbacks = self.callbacks.read_irq_disabled();
-        // Returns ture if there may be more events to handle
+        // Returns true if there may be more events to handle
         let handle_event = |event: &EventBuf| -> bool {
             event.sync().unwrap();
             let event: VirtioInputEvent = event.read().unwrap();

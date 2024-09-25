@@ -9,7 +9,8 @@ use super::Frame;
 use crate::{
     mm::{
         page::{cont_pages::ContPages, meta::FrameMeta, Page},
-        HasPaddr, Paddr, VmIo, VmReader, VmWriter, PAGE_SIZE,
+        FallibleVmRead, FallibleVmWrite, HasPaddr, Infallible, Paddr, VmIo, VmReader, VmWriter,
+        PAGE_SIZE,
     },
     Error, Result,
 };
@@ -95,44 +96,54 @@ impl Segment {
 
 impl<'a> Segment {
     /// Returns a reader to read data from it.
-    pub fn reader(&'a self) -> VmReader<'a> {
-        // SAFETY: the memory of the page frames is untyped, contiguous and is valid during `'a`.
-        // Currently, only slice can generate `VmWriter` with typed memory, and this `Segment` cannot
-        // generate or be generated from an alias slice, so the reader will not overlap with `VmWriter`
-        // with typed memory.
+    pub fn reader(&'a self) -> VmReader<'a, Infallible> {
+        // SAFETY:
+        // - The memory range points to untyped memory.
+        // - The segment is alive during the lifetime `'a`.
+        // - Using `VmReader` and `VmWriter` is the only way to access the segment.
         unsafe { VmReader::from_kernel_space(self.as_ptr(), self.nbytes()) }
     }
 
     /// Returns a writer to write data into it.
-    pub fn writer(&'a self) -> VmWriter<'a> {
-        // SAFETY: the memory of the page frames is untyped, contiguous and is valid during `'a`.
-        // Currently, only slice can generate `VmReader` with typed memory, and this `Segment` cannot
-        // generate or be generated from an alias slice, so the writer will not overlap with `VmReader`
-        // with typed memory.
+    pub fn writer(&'a self) -> VmWriter<'a, Infallible> {
+        // SAFETY:
+        // - The memory range points to untyped memory.
+        // - The segment is alive during the lifetime `'a`.
+        // - Using `VmReader` and `VmWriter` is the only way to access the segment.
         unsafe { VmWriter::from_kernel_space(self.as_mut_ptr(), self.nbytes()) }
     }
 }
 
 impl VmIo for Segment {
-    fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+    fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<()> {
+        let read_len = writer.avail();
         // Do bound check with potential integer overflow in mind
-        let max_offset = offset.checked_add(buf.len()).ok_or(Error::Overflow)?;
+        let max_offset = offset.checked_add(read_len).ok_or(Error::Overflow)?;
         if max_offset > self.nbytes() {
             return Err(Error::InvalidArgs);
         }
-        let len = self.reader().skip(offset).read(&mut buf.into());
-        debug_assert!(len == buf.len());
+        let len = self
+            .reader()
+            .skip(offset)
+            .read_fallible(writer)
+            .map_err(|(e, _)| e)?;
+        debug_assert!(len == read_len);
         Ok(())
     }
 
-    fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<()> {
+    fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
+        let write_len = reader.remain();
         // Do bound check with potential integer overflow in mind
-        let max_offset = offset.checked_add(buf.len()).ok_or(Error::Overflow)?;
+        let max_offset = offset.checked_add(reader.remain()).ok_or(Error::Overflow)?;
         if max_offset > self.nbytes() {
             return Err(Error::InvalidArgs);
         }
-        let len = self.writer().skip(offset).write(&mut buf.into());
-        debug_assert!(len == buf.len());
+        let len = self
+            .writer()
+            .skip(offset)
+            .write_fallible(reader)
+            .map_err(|(e, _)| e)?;
+        debug_assert!(len == write_len);
         Ok(())
     }
 }

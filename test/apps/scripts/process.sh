@@ -21,6 +21,8 @@ hello_world/hello_world
 itimer/setitimer
 itimer/timer_create
 mmap/mmap_and_fork
+mmap/mmap_shared_filebacked
+mmap/mmap_readahead
 pthread/pthread_test
 pty/open_pty
 signal_c/parent_death_signal

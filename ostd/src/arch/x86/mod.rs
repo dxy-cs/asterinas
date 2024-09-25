@@ -14,10 +14,21 @@ pub(crate) mod pci;
 pub mod qemu;
 pub mod serial;
 pub mod task;
-#[cfg(feature = "intel_tdx")]
-pub(crate) mod tdx_guest;
 pub mod timer;
 pub mod trap;
+
+use cfg_if::cfg_if;
+
+cfg_if! {
+    if #[cfg(feature = "cvm_guest")] {
+        pub(crate) mod tdx_guest;
+
+        use {
+            crate::early_println,
+            ::tdx_guest::{init_tdx, tdcall::InitError, tdx_is_enabled},
+        };
+    }
+}
 
 use core::{
     arch::x86_64::{_rdrand64_step, _rdtsc},
@@ -26,13 +37,8 @@ use core::{
 
 use kernel::apic::ioapic;
 use log::{info, warn};
-#[cfg(feature = "intel_tdx")]
-use {
-    crate::early_println,
-    ::tdx_guest::{init_tdx, tdcall::InitError, tdx_is_enabled},
-};
 
-#[cfg(feature = "intel_tdx")]
+#[cfg(feature = "cvm_guest")]
 pub(crate) fn check_tdx_init() {
     match init_tdx() {
         Ok(td_info) => {
@@ -54,11 +60,18 @@ pub(crate) fn check_tdx_init() {
 }
 
 pub(crate) fn init_on_bsp() {
+    // SAFETY: this function is only called once on BSP.
+    unsafe {
+        crate::arch::trap::init(true);
+    }
     irq::init();
     kernel::acpi::init();
 
-    // SAFETY: it is only called once and ACPI has been initialized.
-    unsafe { crate::cpu::init() };
+    // SAFETY: they are only called once on BSP and ACPI has been initialized.
+    unsafe {
+        crate::cpu::init_num_cpus();
+        crate::cpu::set_this_cpu_id(0);
+    }
 
     match kernel::apic::init() {
         Ok(_) => {
@@ -73,32 +86,47 @@ pub(crate) fn init_on_bsp() {
 
     // SAFETY: no CPU local objects have been accessed by this far. And
     // we are on the BSP.
-    unsafe { crate::cpu::cpu_local::init_on_bsp() };
+    unsafe { crate::cpu::local::init_on_bsp() };
 
     crate::boot::smp::boot_all_aps();
 
     timer::init();
 
-    #[cfg(feature = "intel_tdx")]
-    if !tdx_is_enabled() {
-        match iommu::init() {
-            Ok(_) => {}
-            Err(err) => warn!("IOMMU initialization error:{:?}", err),
+    cfg_if! {
+        if #[cfg(feature = "cvm_guest")] {
+            if !tdx_is_enabled() {
+                match iommu::init() {
+                    Ok(_) => {}
+                    Err(err) => warn!("IOMMU initialization error:{:?}", err),
+                }
+            }
+        } else {
+            match iommu::init() {
+                Ok(_) => {}
+                Err(err) => warn!("IOMMU initialization error:{:?}", err),
+            }
         }
     }
-    #[cfg(not(feature = "intel_tdx"))]
-    match iommu::init() {
-        Ok(_) => {}
-        Err(err) => warn!("IOMMU initialization error:{:?}", err),
-    }
+
     // Some driver like serial may use PIC
     kernel::pic::init();
+}
+
+/// Architecture-specific initialization on the application processor.
+///
+/// # Safety
+///
+/// This function must be called only once on each application processor.
+/// And it should be called after the BSP's call to [`init_on_bsp`].
+pub(crate) unsafe fn init_on_ap() {
+    // Trigger the initialization of the local APIC.
+    crate::arch::x86::kernel::apic::with_borrow(|_| {});
 }
 
 pub(crate) fn interrupts_ack(irq_number: usize) {
     if !cpu::CpuException::is_cpu_exception(irq_number as u16) {
         kernel::pic::ack();
-        kernel::apic::borrow(|apic| {
+        kernel::apic::with_borrow(|apic| {
             apic.eoi();
         });
     }

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! The base crate is the OSDK generated crate that is ultimately built by cargo.
-//! It will depend on the kernel crate.
-//!
+//! It will depend on the to-be-built kernel crate or the to-be-tested crate.
 
 use std::{
     fs,
@@ -12,10 +11,16 @@ use std::{
 
 use crate::util::get_cargo_metadata;
 
+/// Create a new base crate that will be built by cargo.
+///
+/// The dependencies of the base crate will be the target crate. If
+/// `link_unit_test_runner` is set to true, the base crate will also depend on
+/// the `ostd-test-runner` crate.
 pub fn new_base_crate(
     base_crate_path: impl AsRef<Path>,
     dep_crate_name: &str,
     dep_crate_path: impl AsRef<Path>,
+    link_unit_test_runner: bool,
 ) {
     let workspace_root = {
         let meta = get_cargo_metadata(None::<&str>, None::<&[&str]>).unwrap();
@@ -75,14 +80,14 @@ pub fn new_base_crate(
     // here when OSTD is ready
     include_linker_script!(["x86_64.ld"]);
 
-    // Overrite the main.rs file
+    // Overwrite the main.rs file
     let main_rs = include_str!("main.rs.template");
-    // Replace all occurence of `#TARGET_NAME#` with the `dep_crate_name`
+    // Replace all occurrence of `#TARGET_NAME#` with the `dep_crate_name`
     let main_rs = main_rs.replace("#TARGET_NAME#", &dep_crate_name.replace('-', "_"));
     fs::write("src/main.rs", main_rs).unwrap();
 
     // Add dependencies to the Cargo.toml
-    add_manifest_dependency(dep_crate_name, dep_crate_path);
+    add_manifest_dependency(dep_crate_name, dep_crate_path, link_unit_test_runner);
 
     // Copy the manifest configurations from the target crate to the base crate
     copy_profile_configurations(workspace_root);
@@ -94,11 +99,15 @@ pub fn new_base_crate(
     std::env::set_current_dir(original_dir).unwrap();
 }
 
-fn add_manifest_dependency(crate_name: &str, crate_path: impl AsRef<Path>) {
-    let mainfest_path = "Cargo.toml";
+fn add_manifest_dependency(
+    crate_name: &str,
+    crate_path: impl AsRef<Path>,
+    link_unit_test_runner: bool,
+) {
+    let manifest_path = "Cargo.toml";
 
     let mut manifest: toml::Table = {
-        let content = fs::read_to_string(mainfest_path).unwrap();
+        let content = fs::read_to_string(manifest_path).unwrap();
         toml::from_str(&content).unwrap()
     };
 
@@ -112,16 +121,37 @@ fn add_manifest_dependency(crate_name: &str, crate_path: impl AsRef<Path>) {
 
     let dependencies = manifest.get_mut("dependencies").unwrap();
 
-    let dep = toml::Table::from_str(&format!(
+    let target_dep = toml::Table::from_str(&format!(
         "{} = {{ path = \"{}\", default-features = false }}",
         crate_name,
         crate_path.as_ref().display()
     ))
     .unwrap();
-    dependencies.as_table_mut().unwrap().extend(dep);
+    dependencies.as_table_mut().unwrap().extend(target_dep);
+
+    if link_unit_test_runner {
+        let dep_str = match option_env!("OSDK_LOCAL_DEV") {
+            Some("1") => {
+                let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let test_kernel_dir = crate_dir.join("test-kernel");
+                format!(
+                    "osdk-test-kernel = {{ path = \"{}\" }}",
+                    test_kernel_dir.display()
+                )
+            }
+            _ => concat!(
+                "osdk-test-kernel = { version = \"",
+                env!("CARGO_PKG_VERSION"),
+                "\" }"
+            )
+            .to_owned(),
+        };
+        let test_runner_dep = toml::Table::from_str(&dep_str).unwrap();
+        dependencies.as_table_mut().unwrap().extend(test_runner_dep);
+    }
 
     let content = toml::to_string(&manifest).unwrap();
-    fs::write(mainfest_path, content).unwrap();
+    fs::write(manifest_path, content).unwrap();
 }
 
 fn copy_profile_configurations(workspace_root: impl AsRef<Path>) {

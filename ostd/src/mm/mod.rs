@@ -20,15 +20,15 @@ pub(crate) mod page_table;
 pub mod stat;
 pub mod vm_space;
 
-use alloc::vec::Vec;
 use core::{fmt::Debug, ops::Range};
-
-use spin::Once;
 
 pub use self::{
     dma::{Daddr, DmaCoherent, DmaDirection, DmaStream, DmaStreamSlice, HasDaddr},
     frame::{options::FrameAllocOptions, Frame, Segment},
-    io::{KernelSpace, UserSpace, VmIo, VmReader, VmWriter},
+    io::{
+        Fallible, FallibleVmRead, FallibleVmWrite, Infallible, PodOnce, VmIo, VmIoOnce, VmReader,
+        VmWriter,
+    },
     page_prop::{CachePolicy, PageFlags, PageProperty},
     vm_space::VmSpace,
 };
@@ -36,10 +36,7 @@ pub(crate) use self::{
     kspace::paddr_to_vaddr, page::meta::init as init_page_meta, page_prop::PrivilegedPageFlags,
     page_table::PageTable,
 };
-use crate::{
-    arch::mm::PagingConsts,
-    boot::memory_region::{MemoryRegion, MemoryRegionType},
-};
+use crate::arch::mm::PagingConsts;
 
 /// The level of a page table node or a frame.
 pub type PagingLevel = u8;
@@ -91,7 +88,7 @@ pub(crate) const fn nr_base_per_page<C: PagingConstsTrait>(level: PagingLevel) -
 
 /// The maximum virtual address of user space (non inclusive).
 ///
-/// Typicall 64-bit systems have at least 48-bit virtual address space.
+/// Typical 64-bit systems have at least 48-bit virtual address space.
 /// A typical way to reserve half of the address space for the kernel is
 /// to use the highest 48-bit virtual address space.
 ///
@@ -115,19 +112,4 @@ pub trait HasPaddr {
 /// Checks if the given address is page-aligned.
 pub const fn is_page_aligned(p: usize) -> bool {
     (p & (PAGE_SIZE - 1)) == 0
-}
-
-/// Memory regions used for frame buffer.
-pub static FRAMEBUFFER_REGIONS: Once<Vec<MemoryRegion>> = Once::new();
-
-pub(crate) fn misc_init() {
-    dma::init();
-
-    let mut framebuffer_regions = Vec::new();
-    for i in crate::boot::memory_regions() {
-        if i.typ() == MemoryRegionType::Framebuffer {
-            framebuffer_regions.push(*i);
-        }
-    }
-    FRAMEBUFFER_REGIONS.call_once(|| framebuffer_regions);
 }

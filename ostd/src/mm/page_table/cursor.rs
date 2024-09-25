@@ -48,7 +48,7 @@
 //!
 //! ## Validity
 //!
-//! The page table cursor API will guarentee that the page table, as a data
+//! The page table cursor API will guarantee that the page table, as a data
 //! structure, whose occupied memory will not suffer from data races. This is
 //! ensured by the page table lock protocol. In other words, any operations
 //! provided by the APIs (as long as safety requirements are met) will not
@@ -73,10 +73,13 @@ use super::{
     page_size, pte_index, Child, KernelMode, PageTable, PageTableEntryTrait, PageTableError,
     PageTableMode, PageTableNode, PagingConstsTrait, PagingLevel, UserMode,
 };
-use crate::mm::{page::DynPage, Paddr, PageProperty, Vaddr};
+use crate::{
+    mm::{page::DynPage, Paddr, PageProperty, Vaddr},
+    task::{disable_preempt, DisabledPreemptGuard},
+};
 
 #[derive(Clone, Debug)]
-pub enum PageTableQueryResult {
+pub enum PageTableItem {
     NotMapped {
         va: Vaddr,
         len: usize,
@@ -113,7 +116,7 @@ where
     /// index 0, and the level N page table lock guard is at index N - 1.
     ///
     /// When destructing the cursor, the locks will be released in the order
-    /// from low to high, exactly the reverse order of the aquisition.
+    /// from low to high, exactly the reverse order of the acquisition.
     /// This behavior is ensured by the default drop implementation of Rust:
     /// <https://doc.rust-lang.org/reference/destructors.html>.
     guards: [Option<PageTableNode<E, C>>; C::NR_LEVELS as usize],
@@ -125,7 +128,8 @@ where
     va: Vaddr,
     /// The virtual address range that is locked.
     barrier_va: Range<Vaddr>,
-    phantom: PhantomData<&'a PageTable<M, E, C>>,
+    preempt_guard: DisabledPreemptGuard,
+    _phantom: PhantomData<&'a PageTable<M, E, C>>,
 }
 
 impl<'a, M: PageTableMode, E: PageTableEntryTrait, C: PagingConstsTrait> Cursor<'a, M, E, C>
@@ -141,7 +145,7 @@ where
     /// Note that this function does not ensure exclusive access to the claimed
     /// virtual address range. The accesses using this cursor may block or fail.
     pub fn new(pt: &'a PageTable<M, E, C>, va: &Range<Vaddr>) -> Result<Self, PageTableError> {
-        if !M::covers(va) {
+        if !M::covers(va) || va.is_empty() {
             return Err(PageTableError::InvalidVaddrRange(va.start, va.end));
         }
         if va.start % C::BASE_PAGE_SIZE != 0 || va.end % C::BASE_PAGE_SIZE != 0 {
@@ -162,7 +166,8 @@ where
             guard_level: C::NR_LEVELS,
             va: va.start,
             barrier_va: va.clone(),
-            phantom: PhantomData,
+            preempt_guard: disable_preempt(),
+            _phantom: PhantomData,
         };
 
         // Go down and get proper locks. The cursor should hold a lock of a
@@ -195,7 +200,7 @@ where
     }
 
     /// Gets the information of the current slot.
-    pub fn query(&mut self) -> Result<PageTableQueryResult, PageTableError> {
+    pub fn query(&mut self) -> Result<PageTableItem, PageTableError> {
         if self.va >= self.barrier_va.end {
             return Err(PageTableError::InvalidVaddr(self.va));
         }
@@ -204,36 +209,27 @@ where
             let level = self.level;
             let va = self.va;
 
-            let pte = self.read_cur_pte();
-            if !pte.is_present() {
-                return Ok(PageTableQueryResult::NotMapped {
-                    va,
-                    len: page_size::<C>(level),
-                });
-            }
-            if !pte.is_last(level) {
-                self.level_down();
-                continue;
-            }
-
             match self.cur_child() {
-                Child::Page(page) => {
-                    return Ok(PageTableQueryResult::Mapped {
+                Child::PageTable(_) => {
+                    self.level_down();
+                    continue;
+                }
+                Child::None => {
+                    return Ok(PageTableItem::NotMapped {
                         va,
-                        page,
-                        prop: pte.prop(),
+                        len: page_size::<C>(level),
                     });
                 }
-                Child::Untracked(pa) => {
-                    return Ok(PageTableQueryResult::MappedUntracked {
+                Child::Page(page, prop) => {
+                    return Ok(PageTableItem::Mapped { va, page, prop });
+                }
+                Child::Untracked(pa, prop) => {
+                    return Ok(PageTableItem::MappedUntracked {
                         va,
                         pa,
                         len: page_size::<C>(level),
-                        prop: pte.prop(),
+                        prop,
                     });
-                }
-                Child::None | Child::PageTable(_) => {
-                    unreachable!(); // Already checked with the PTE.
                 }
             }
         }
@@ -253,14 +249,16 @@ where
     }
 
     /// Jumps to the given virtual address.
+    /// If the target address is out of the range, this method will return `Err`.
     ///
     /// # Panics
     ///
-    /// This method panics if the address is out of the range where the cursor is required to operate,
-    /// or has bad alignment.
-    pub fn jump(&mut self, va: Vaddr) {
-        assert!(self.barrier_va.contains(&va));
+    /// This method panics if the address has bad alignment.
+    pub fn jump(&mut self, va: Vaddr) -> Result<(), PageTableError> {
         assert!(va % C::BASE_PAGE_SIZE == 0);
+        if !self.barrier_va.contains(&va) {
+            return Err(PageTableError::InvalidVaddr(va));
+        }
 
         loop {
             let cur_node_start = self.va & !(page_size::<C>(self.level + 1) - 1);
@@ -268,14 +266,14 @@ where
             // If the address is within the current node, we can jump directly.
             if cur_node_start <= va && va < cur_node_end {
                 self.va = va;
-                return;
+                return Ok(());
             }
 
             // There is a corner case that the cursor is depleted, sitting at the start of the
             // next node but the next node is not locked because the parent is not locked.
             if self.va >= self.barrier_va.end && self.level == self.guard_level {
                 self.va = va;
-                return;
+                return Ok(());
             }
 
             debug_assert!(self.level < self.guard_level);
@@ -285,6 +283,10 @@ where
 
     pub fn virt_addr(&self) -> Vaddr {
         self.va
+    }
+
+    pub fn preempt_guard(&self) -> &DisabledPreemptGuard {
+        &self.preempt_guard
     }
 
     /// Goes up a level. We release the current page if it has no mappings since the cursor only moves
@@ -355,7 +357,7 @@ impl<'a, M: PageTableMode, E: PageTableEntryTrait, C: PagingConstsTrait> Iterato
 where
     [(); C::NR_LEVELS as usize]:,
 {
-    type Item = PageTableQueryResult;
+    type Item = PageTableItem;
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = self.query();
@@ -405,7 +407,7 @@ where
     ///
     /// This method panics if the address is out of the range where the cursor is required to operate,
     /// or has bad alignment.
-    pub fn jump(&mut self, va: Vaddr) {
+    pub fn jump(&mut self, va: Vaddr) -> Result<(), PageTableError> {
         self.0.jump(va)
     }
 
@@ -415,11 +417,13 @@ where
     }
 
     /// Gets the information of the current slot.
-    pub fn query(&mut self) -> Result<PageTableQueryResult, PageTableError> {
+    pub fn query(&mut self) -> Result<PageTableItem, PageTableError> {
         self.0.query()
     }
 
     /// Maps the range starting from the current address to a [`DynPage`].
+    ///
+    /// It returns the previously mapped [`DynPage`] if that exists.
     ///
     /// # Panics
     ///
@@ -432,7 +436,7 @@ where
     ///
     /// The caller should ensure that the virtual range being mapped does
     /// not affect kernel's memory safety.
-    pub unsafe fn map(&mut self, page: DynPage, prop: PageProperty) {
+    pub unsafe fn map(&mut self, page: DynPage, prop: PageProperty) -> Option<DynPage> {
         let end = self.0.va + page.size();
         assert!(end <= self.0.barrier_va.end);
         debug_assert!(self.0.in_tracked_range());
@@ -456,8 +460,19 @@ where
 
         // Map the current page.
         let idx = self.0.cur_idx();
-        self.cur_node_mut().set_child_page(idx, page, prop);
+        let old = self
+            .cur_node_mut()
+            .replace_child(idx, Child::Page(page, prop), true);
         self.0.move_forward();
+
+        match old {
+            Child::Page(old_page, _) => Some(old_page),
+            Child::None => None,
+            Child::PageTable(_) => {
+                todo!("Dropping page table nodes while mapping requires TLB flush")
+            }
+            Child::Untracked(_, _) => panic!("Mapping a tracked page in an untracked range"),
+        }
     }
 
     /// Maps the range starting from the current address to a physical address range.
@@ -518,7 +533,9 @@ where
             // Map the current page.
             debug_assert!(!self.0.in_tracked_range());
             let idx = self.0.cur_idx();
-            self.cur_node_mut().set_child_untracked(idx, pa, prop);
+            let _ = self
+                .cur_node_mut()
+                .replace_child(idx, Child::Untracked(pa, prop), false);
 
             let level = self.0.level;
             pa += page_size::<C>(level);
@@ -526,24 +543,35 @@ where
         }
     }
 
-    /// Unmaps the range starting from the current address with the given length of virtual address.
+    /// Find and remove the first page in the cursor's following range.
     ///
-    /// Already-absent mappings encountered by the cursor will be skipped. It is valid to unmap a
-    /// range that is not mapped.
+    /// The range to be found in is the current virtual address with the
+    /// provided length.
+    ///
+    /// The function stops and yields the page if it has actually removed a
+    /// page, no matter if the following pages are also required to be unmapped.
+    /// The returned page is the virtual page that existed before the removal
+    /// but having just been unmapped.
+    ///
+    /// It also makes the cursor moves forward to the next page after the
+    /// removed one, when an actual page is removed. If no mapped pages exist
+    /// in the following range, the cursor will stop at the end of the range
+    /// and return [`PageTableItem::NotMapped`].
     ///
     /// # Safety
     ///
-    /// The caller should ensure that the range being unmapped does not affect kernel's memory safety.
+    /// The caller should ensure that the range being unmapped does not affect
+    /// kernel's memory safety.
     ///
     /// # Panics
     ///
-    /// This function will panic if:
-    ///  - the range to be unmapped is out of the range where the cursor is required to operate;
-    ///  - the range covers only a part of a page.
-    pub unsafe fn unmap(&mut self, len: usize) {
-        let end = self.0.va + len;
+    /// This function will panic if the end range covers a part of a huge page
+    /// and the next page is that huge page.
+    pub unsafe fn take_next(&mut self, len: usize) -> PageTableItem {
+        let start = self.0.va;
+        assert!(len % page_size::<C>(1) == 0);
+        let end = start + len;
         assert!(end <= self.0.barrier_va.end);
-        assert!(end % C::BASE_PAGE_SIZE == 0);
 
         while self.0.va < end {
             let cur_pte = self.0.read_cur_pte();
@@ -552,79 +580,109 @@ where
             // Skip if it is already absent.
             if !cur_pte.is_present() {
                 if self.0.va + page_size::<C>(self.0.level) > end {
+                    self.0.va = end;
                     break;
                 }
                 self.0.move_forward();
                 continue;
             }
 
-            // We check among the conditions that may lead to a level down.
-            // We ensure not unmapping in reserved kernel shared tables or releasing it.
-            let is_kernel_shared_node =
-                TypeId::of::<M>() == TypeId::of::<KernelMode>() && self.0.level >= C::NR_LEVELS - 1;
-            if is_kernel_shared_node
-                || self.0.va % page_size::<C>(self.0.level) != 0
-                || self.0.va + page_size::<C>(self.0.level) > end
-            {
-                if cur_pte.is_present() && !cur_pte.is_last(self.0.level) {
-                    self.0.level_down();
+            // Level down if the current PTE points to a page table.
+            if !cur_pte.is_last(self.0.level) {
+                self.0.level_down();
 
-                    // We have got down a level. If there's no mapped PTEs in
-                    // the current node, we can go back and skip to save time.
-                    if self.0.guards[(self.0.level - 1) as usize]
-                        .as_ref()
-                        .unwrap()
-                        .nr_children()
-                        == 0
-                    {
-                        self.0.level_up();
-                        self.0.move_forward();
-                        continue;
-                    }
-                } else if !is_tracked {
-                    self.level_down_split();
-                } else {
-                    unreachable!();
+                // We have got down a level. If there's no mapped PTEs in
+                // the current node, we can go back and skip to save time.
+                if self.0.guards[(self.0.level - 1) as usize]
+                    .as_ref()
+                    .unwrap()
+                    .nr_children()
+                    == 0
+                {
+                    self.0.level_up();
+                    self.0.move_forward();
                 }
+
                 continue;
             }
 
-            // Unmap the current page.
+            // Level down if we are removing part of a huge untracked page.
+            if self.0.va % page_size::<C>(self.0.level) != 0
+                || self.0.va + page_size::<C>(self.0.level) > end
+            {
+                if !is_tracked {
+                    self.level_down_split();
+                    continue;
+                } else {
+                    panic!("removing part of a huge page");
+                }
+            }
+
+            // Unmap the current page and return it.
             let idx = self.0.cur_idx();
-            self.cur_node_mut().unset_child(idx, is_tracked);
+            let ret = self
+                .cur_node_mut()
+                .replace_child(idx, Child::None, is_tracked);
+            let ret_page_va = self.0.va;
+            let ret_page_size = page_size::<C>(self.0.level);
 
             self.0.move_forward();
+
+            return match ret {
+                Child::Page(page, prop) => PageTableItem::Mapped {
+                    va: ret_page_va,
+                    page,
+                    prop,
+                },
+                Child::Untracked(pa, prop) => PageTableItem::MappedUntracked {
+                    va: ret_page_va,
+                    pa,
+                    len: ret_page_size,
+                    prop,
+                },
+                Child::None | Child::PageTable(_) => unreachable!(),
+            };
         }
+
+        // If the loop exits, we did not find any mapped pages in the range.
+        PageTableItem::NotMapped { va: start, len }
     }
 
-    /// Applies the given operation to all the mappings within the range.
+    /// Applies the operation to the next slot of mapping within the range.
     ///
-    /// The funtction will return an error if it is not allowed to protect an invalid range and
-    /// it does so, or if the range to be protected only covers a part of a page.
+    /// The range to be found in is the current virtual address with the
+    /// provided length.
+    ///
+    /// The function stops and yields the actually protected range if it has
+    /// actually protected a page, no matter if the following pages are also
+    /// required to be protected.
+    ///
+    /// It also makes the cursor moves forward to the next page after the
+    /// protected one. If no mapped pages exist in the following range, the
+    /// cursor will stop at the end of the range and return [`None`].
     ///
     /// # Safety
     ///
-    /// The caller should ensure that the range being protected does not affect kernel's memory safety.
+    /// The caller should ensure that the range being protected with the
+    /// operation does not affect kernel's memory safety.
     ///
     /// # Panics
     ///
     /// This function will panic if:
-    ///  - the range to be protected is out of the range where the cursor is required to operate.
-    pub unsafe fn protect(
+    ///  - the range to be protected is out of the range where the cursor
+    ///    is required to operate;
+    ///  - the specified virtual address range only covers a part of a page.
+    pub unsafe fn protect_next(
         &mut self,
         len: usize,
-        mut op: impl FnMut(&mut PageProperty),
-        allow_protect_absent: bool,
-    ) -> Result<(), PageTableError> {
+        op: &mut impl FnMut(&mut PageProperty),
+    ) -> Option<Range<Vaddr>> {
         let end = self.0.va + len;
         assert!(end <= self.0.barrier_va.end);
 
         while self.0.va < end {
             let cur_pte = self.0.read_cur_pte();
             if !cur_pte.is_present() {
-                if !allow_protect_absent {
-                    return Err(PageTableError::ProtectingAbsent);
-                }
                 self.0.move_forward();
                 continue;
             }
@@ -632,18 +690,33 @@ where
             // Go down if it's not a last node.
             if !cur_pte.is_last(self.0.level) {
                 self.0.level_down();
+
+                // We have got down a level. If there's no mapped PTEs in
+                // the current node, we can go back and skip to save time.
+                if self.0.guards[(self.0.level - 1) as usize]
+                    .as_ref()
+                    .unwrap()
+                    .nr_children()
+                    == 0
+                {
+                    self.0.level_up();
+                    self.0.move_forward();
+                }
+
                 continue;
             }
 
             // Go down if the page size is too big and we are protecting part
             // of untracked huge pages.
-            let vaddr_not_fit = self.0.va % page_size::<C>(self.0.level) != 0
-                || self.0.va + page_size::<C>(self.0.level) > end;
-            if !self.0.in_tracked_range() && vaddr_not_fit {
-                self.level_down_split();
-                continue;
-            } else if vaddr_not_fit {
-                return Err(PageTableError::ProtectingPartial);
+            if self.0.va % page_size::<C>(self.0.level) != 0
+                || self.0.va + page_size::<C>(self.0.level) > end
+            {
+                if self.0.in_tracked_range() {
+                    panic!("protecting part of a huge page");
+                } else {
+                    self.level_down_split();
+                    continue;
+                }
             }
 
             let mut pte_prop = cur_pte.prop();
@@ -651,10 +724,18 @@ where
 
             let idx = self.0.cur_idx();
             self.cur_node_mut().protect(idx, pte_prop);
+            let protected_va = self.0.va..self.0.va + page_size::<C>(self.0.level);
 
             self.0.move_forward();
+
+            return Some(protected_va);
         }
-        Ok(())
+
+        None
+    }
+
+    pub fn preempt_guard(&self) -> &DisabledPreemptGuard {
+        &self.0.preempt_guard
     }
 
     /// Consumes itself and leak the root guard for the caller if it locked the root level.
@@ -683,8 +764,12 @@ where
         let new_node = PageTableNode::<E, C>::alloc(self.0.level - 1);
         let idx = self.0.cur_idx();
         let is_tracked = self.0.in_tracked_range();
-        self.cur_node_mut()
-            .set_child_pt(idx, new_node.clone_raw(), is_tracked);
+        let old = self.cur_node_mut().replace_child(
+            idx,
+            Child::PageTable(new_node.clone_raw()),
+            is_tracked,
+        );
+        debug_assert!(old.is_none());
         self.0.level -= 1;
         self.0.guards[(self.0.level - 1) as usize] = Some(new_node);
     }

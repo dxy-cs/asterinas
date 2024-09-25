@@ -81,10 +81,9 @@ impl aster_block::BlockDevice for BlockDevice {
     }
 
     fn metadata(&self) -> BlockDeviceMeta {
-        let device_config = self.device.config.read().unwrap();
         BlockDeviceMeta {
             max_nr_segments_per_bio: self.queue.max_nr_segments_per_bio(),
-            nr_sectors: device_config.capacity_sectors(),
+            nr_sectors: VirtioBlockConfig::read_capacity_sectors(&self.device.config).unwrap(),
         }
     }
 }
@@ -107,7 +106,7 @@ impl DeviceInner {
     pub fn init(mut transport: Box<dyn VirtioTransport>) -> Result<Arc<Self>, VirtioDeviceError> {
         let config = VirtioBlockConfig::new(transport.as_mut());
         assert_eq!(
-            config.read().unwrap().block_size(),
+            VirtioBlockConfig::read_block_size(&config).unwrap(),
             VirtioBlockConfig::sector_size(),
             "currently not support customized device logical block size"
         );
@@ -174,7 +173,7 @@ impl DeviceInner {
         info!("Virtio block device handle irq");
         // When we enter the IRQs handling function,
         // IRQs have already been disabled,
-        // so there is no need to call `lock_irq_disabled`.
+        // so there is no need to call `disable_irq`.
         loop {
             // Pops the complete request
             let complete_request = {
@@ -221,7 +220,7 @@ impl DeviceInner {
     // TODO: Most logic is the same as read and write, there should be a refactor.
     // TODO: Should return an Err instead of panic if the device fails.
     fn request_device_id(&self) -> String {
-        let id = self.id_allocator.lock_irq_disabled().alloc().unwrap();
+        let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
         let req_slice = {
             let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);
             let req = BlockReq {
@@ -250,7 +249,7 @@ impl DeviceInner {
         let device_id_slice = DmaStreamSlice::new(&device_id_stream, 0, MAX_ID_LENGTH);
         let outputs = vec![&device_id_slice, &resp_slice];
 
-        let mut queue = self.queue.lock_irq_disabled();
+        let mut queue = self.queue.disable_irq().lock();
         let token = queue
             .add_dma_buf(&[&req_slice], outputs.as_slice())
             .expect("add queue failed");
@@ -263,7 +262,7 @@ impl DeviceInner {
         queue.pop_used_with_token(token).expect("pop used failed");
 
         resp_slice.sync().unwrap();
-        self.id_allocator.lock_irq_disabled().free(id);
+        self.id_allocator.disable_irq().lock().free(id);
         let resp: BlockResp = resp_slice.read_val(0).unwrap();
         match RespStatus::try_from(resp.status).unwrap() {
             RespStatus::Ok => {}
@@ -288,7 +287,7 @@ impl DeviceInner {
     fn read(&self, bio_request: BioRequest) {
         let dma_streams = Self::dma_stream_map(&bio_request);
 
-        let id = self.id_allocator.lock_irq_disabled().alloc().unwrap();
+        let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
         let req_slice = {
             let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);
             let req = BlockReq {
@@ -325,7 +324,7 @@ impl DeviceInner {
         }
 
         loop {
-            let mut queue = self.queue.lock_irq_disabled();
+            let mut queue = self.queue.disable_irq().lock();
             if num_used_descs > queue.available_desc() {
                 continue;
             }
@@ -339,7 +338,8 @@ impl DeviceInner {
             // Records the submitted request
             let submitted_request = SubmittedRequest::new(id as u16, bio_request, dma_streams);
             self.submitted_requests
-                .lock_irq_disabled()
+                .disable_irq()
+                .lock()
                 .insert(token, submitted_request);
             return;
         }
@@ -349,7 +349,7 @@ impl DeviceInner {
     fn write(&self, bio_request: BioRequest) {
         let dma_streams = Self::dma_stream_map(&bio_request);
 
-        let id = self.id_allocator.lock_irq_disabled().alloc().unwrap();
+        let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
         let req_slice = {
             let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);
             let req = BlockReq {
@@ -385,7 +385,7 @@ impl DeviceInner {
             panic!("The request size surpasses the queue size");
         }
         loop {
-            let mut queue = self.queue.lock_irq_disabled();
+            let mut queue = self.queue.disable_irq().lock();
             if num_used_descs > queue.available_desc() {
                 continue;
             }
@@ -399,7 +399,8 @@ impl DeviceInner {
             // Records the submitted request
             let submitted_request = SubmittedRequest::new(id as u16, bio_request, dma_streams);
             self.submitted_requests
-                .lock_irq_disabled()
+                .disable_irq()
+                .lock()
                 .insert(token, submitted_request);
             return;
         }

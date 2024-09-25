@@ -9,7 +9,7 @@
 //! immediately after the initialization of `ostd`. Thus you can use any
 //! feature provided by the frame including the heap allocator, etc.
 //!
-//! By all means, ostd-test is an individule crate that only requires:
+//! By all means, ostd-test is an individual crate that only requires:
 //!  - a custom linker script section `.ktest_array`,
 //!  - and an alloc implementation.
 //!
@@ -45,12 +45,6 @@
 //!
 //! Any crates using the ostd-test framework should be linked with ostd.
 //!
-//! ```toml
-//! # Cargo.toml
-//! [dependencies]
-//! ostd = { path = "relative/path/to/ostd" }
-//! ```
-//!
 //! By the way, `#[ktest]` attribute along also works, but it hinders test control
 //! using cfgs since plain attribute marked test will be executed in all test runs
 //! no matter what cfgs are passed to the compiler. More importantly, using `#[ktest]`
@@ -58,27 +52,10 @@
 //! explicitly stripped in normal builds.
 //!
 //! Rust cfg is used to control the compilation of the test module. In cooperation
-//! with the `ktest` framework, the Makefile will set the `RUSTFLAGS` environment
-//! variable to pass the cfgs to all rustc invocations. To run the tests, you simply
-//! need to set a list of cfgs by specifying `KTEST=1` to the Makefile, e.g.:
-//!
-//! ```bash
-//! make run KTEST=1
-//! ```
-//!
-//! Also, you can run a subset of tests by specifying the `KTEST_WHITELIST` variable.
-//! This is achieved by a whitelist filter on the test name.
-//!
-//! ```bash
-//! make run KTEST=1 KTEST_WHITELIST=failing_assertion,ostd::test::expect_panic
-//! ```
-//!
-//! `KTEST_CRATES` variable is used to specify in which crates the tests to be run.
-//! This is achieved by conditionally compiling the test module using the `#[cfg]`.
-//!
-//! ```bash
-//! make run KTEST=1 KTEST_CRATES=ostd
-//! ``
+//! with the `ktest` framework, OSDK will set the `RUSTFLAGS` environment variable
+//! to pass the cfgs to all rustc invocations. To run the tests, you simply need
+//! to use the command `cargo osdk test` in the crate directory. For more information,
+//! please refer to the OSDK documentation.
 //!
 //! We support the `#[should_panic]` attribute just in the same way as the standard
 //! library do, but the implementation is quite slow currently. Use it with cautious.
@@ -90,10 +67,6 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(panic_info_message)]
 
-pub mod path;
-pub mod runner;
-pub mod tree;
-
 extern crate alloc;
 use alloc::{boxed::Box, string::String};
 
@@ -103,6 +76,7 @@ pub struct PanicInfo {
     pub file: String,
     pub line: usize,
     pub col: usize,
+    pub resolve_panic: fn(),
 }
 
 impl core::fmt::Display for PanicInfo {
@@ -112,6 +86,7 @@ impl core::fmt::Display for PanicInfo {
     }
 }
 
+/// The error that may occur during the test.
 #[derive(Clone)]
 pub enum KtestError {
     Panic(Box<PanicInfo>),
@@ -120,13 +95,22 @@ pub enum KtestError {
     Unknown,
 }
 
+/// The information of the unit test.
 #[derive(Clone, PartialEq, Debug)]
 pub struct KtestItemInfo {
+    /// The path of the module, not including the function name.
+    ///
+    /// It would be separated by `::`.
     pub module_path: &'static str,
+    /// The name of the unit test function.
     pub fn_name: &'static str,
+    /// The name of the crate.
     pub package: &'static str,
+    /// The source file where the test function resides.
     pub source: &'static str,
+    /// The line number of the test function in the file.
     pub line: usize,
+    /// The column number of the test function in the file.
     pub col: usize,
 }
 
@@ -140,6 +124,11 @@ pub struct KtestItem {
 type CatchUnwindImpl = fn(f: fn() -> ()) -> Result<(), Box<dyn core::any::Any + Send>>;
 
 impl KtestItem {
+    /// Create a new [`KtestItem`].
+    ///
+    /// Do not use this function directly. Instead, use the `#[ktest]`
+    /// attribute to mark the test function.
+    #[doc(hidden)]
     pub const fn new(
         fn_: fn() -> (),
         should_panic: (bool, Option<&'static str>),
@@ -152,6 +141,7 @@ impl KtestItem {
         }
     }
 
+    /// Get the information of the test.
     pub fn info(&self) -> &KtestItemInfo {
         &self.info
     }
@@ -174,6 +164,7 @@ impl KtestItem {
                 Ok(()) => Err(KtestError::ShouldPanicButNoPanic),
                 Err(e) => match e.downcast::<PanicInfo>() {
                     Ok(s) => {
+                        (s.resolve_panic)();
                         if let Some(expected) = self.should_panic.1 {
                             if s.message == expected {
                                 Ok(())
@@ -204,12 +195,22 @@ macro_rules! ktest_array {
     }};
 }
 
+/// The iterator of the ktest array.
 pub struct KtestIter {
     index: usize,
 }
 
+impl Default for KtestIter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KtestIter {
-    fn new() -> Self {
+    /// Create a new [`KtestIter`].
+    ///
+    /// It will iterate over all the tests (marked with `#[ktest]`).
+    pub fn new() -> Self {
         Self { index: 0 }
     }
 }
@@ -222,4 +223,29 @@ impl core::iter::Iterator for KtestIter {
         self.index += 1;
         Some(ktest_item.clone())
     }
+}
+
+// The whitelists that will be generated by the OSDK as static consts.
+// They deliver the target tests that the user wants to run.
+extern "Rust" {
+    static KTEST_TEST_WHITELIST: Option<&'static [&'static str]>;
+    static KTEST_CRATE_WHITELIST: Option<&'static [&'static str]>;
+}
+
+/// Get the whitelist of the tests.
+///
+/// The whitelist is generated by the OSDK runner, indicating name of the
+/// target tests that the user wants to run.
+pub fn get_ktest_test_whitelist() -> Option<&'static [&'static str]> {
+    // SAFETY: The two extern statics in the base crate are generated by OSDK.
+    unsafe { KTEST_TEST_WHITELIST }
+}
+
+/// Get the whitelist of the crates.
+///
+/// The whitelist is generated by the OSDK runner, indicating the target crate
+/// that the user wants to test.
+pub fn get_ktest_crate_whitelist() -> Option<&'static [&'static str]> {
+    // SAFETY: The two extern statics in the base crate are generated by OSDK.
+    unsafe { KTEST_CRATE_WHITELIST }
 }
