@@ -74,7 +74,7 @@ use super::{
     PageTableMode, PageTableNode, PagingConstsTrait, PagingLevel, UserMode,
 };
 use crate::{
-    mm::{page::DynPage, Paddr, PageProperty, Vaddr},
+    mm::{page::AnyPage, Paddr, PageProperty, Vaddr},
     task::{disable_preempt, DisabledPreemptGuard},
 };
 
@@ -86,7 +86,7 @@ pub enum PageTableItem {
     },
     Mapped {
         va: Vaddr,
-        page: DynPage,
+        page: AnyPage,
         prop: PageProperty,
     },
     #[allow(dead_code)]
@@ -421,9 +421,9 @@ where
         self.0.query()
     }
 
-    /// Maps the range starting from the current address to a [`DynPage`].
+    /// Maps the range starting from the current address to a [`AnyPage`].
     ///
-    /// It returns the previously mapped [`DynPage`] if that exists.
+    /// It returns the previously mapped [`AnyPage`] if that exists.
     ///
     /// # Panics
     ///
@@ -436,7 +436,7 @@ where
     ///
     /// The caller should ensure that the virtual range being mapped does
     /// not affect kernel's memory safety.
-    pub unsafe fn map(&mut self, page: DynPage, prop: PageProperty) -> Option<DynPage> {
+    pub unsafe fn map(&mut self, page: AnyPage, prop: PageProperty) -> Option<AnyPage> {
         let end = self.0.va + page.size();
         assert!(end <= self.0.barrier_va.end);
         debug_assert!(self.0.in_tracked_range());
