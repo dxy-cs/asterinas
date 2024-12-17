@@ -14,15 +14,15 @@ use ostd::{
     mm::{AnyFrame, FrameAllocOptions, UntypedPage, VmReader, VmWriter},
 };
 
-use crate::prelude::*;
+use crate::{fs::utils::CachePage, fs::utils::PageCacheManager, prelude::*};
 
 mod dyn_cap;
 mod options;
-mod pager;
+//mod pager;
 mod static_cap;
 
 pub use options::VmoOptions;
-pub use pager::Pager;
+//pub use pager::Pager;
 
 /// Virtual Memory Objects (VMOs) are a type of capability that represents a
 /// range of memory pages.
@@ -70,7 +70,7 @@ pub use pager::Pager;
 /// Compared with `AnyFrame`,
 /// `Vmo` is easier to use (by offering more powerful APIs) and
 /// harder to misuse (thanks to its nature of being capability).
-///
+#[derive(Debug)]
 pub struct Vmo<R = Rights>(pub(super) Arc<Vmo_>, R);
 
 /// Functions exist both for static capbility and dynamic capability
@@ -169,11 +169,22 @@ impl Pages {
 /// 2. Anonymous VMO: the VMO without a file backup, which does not have a pager.
 #[derive(Clone)]
 pub(super) struct Vmo_ {
-    pager: Option<Arc<dyn Pager>>,
+    pager: Option<Arc<PageCacheManager>>,
     /// Flags
     flags: VmoFlags,
     /// The virtual pages where the VMO resides.
     pages: Pages,
+    /// Weak pointer pointing to the VMO
+    vmoinvmo_: Weak<Vmo>,
+}
+
+impl Debug for Vmo_ {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Vmo_")
+            .field("flags", &self.flags)
+            .field("size", &self.size())
+            .finish()
+    }
 }
 
 bitflags! {
@@ -193,10 +204,21 @@ impl CommitFlags {
 
 impl Vmo_ {
     /// Prepares a new `AnyFrame` for the target index in pages, returns this new frame.
-    fn prepare_page(&self, page_idx: usize) -> Result<AnyFrame> {
+    fn prepare_page(&self, page_idx: usize) -> Result<CachePage> {
         match &self.pager {
             None => Ok(FrameAllocOptions::new().alloc_single(())?.into()),
-            Some(pager) => pager.commit_page(page_idx),
+            Some(pager) => {
+                let mut page_tmp = pager.commit_page(page_idx)?;
+                {
+                    let mut reverse_map = page_tmp.metadata().reverse_map.write();
+                    if let Some(vmo) = self.vmoinvmo_.upgrade() {
+                        *reverse_map = Some(vmo);
+                    } else { 
+                        *reverse_map = None;
+                    }
+                }
+                Ok(page_tmp)
+            }
         }
     }
 
@@ -313,7 +335,15 @@ impl Vmo_ {
             Ok(())
         };
 
-        self.operate_on_range(&read_range, read, CommitFlags::empty())
+        self.operate_on_range(&read_range, read, CommitFlags::empty())?;
+
+        if let Some(pager) = &self.pager {
+            let page_idx_range = get_page_idx_range(&read_range);
+            for page_idx in page_idx_range {
+                pager.lru_promotion(page_idx)?;
+            }
+        }
+        Ok(())
     }
 
     /// Writes the specified amount of buffer content starting from the target offset in the VMO.
@@ -353,6 +383,7 @@ impl Vmo_ {
             let page_idx_range = get_page_idx_range(&write_range);
             for page_idx in page_idx_range {
                 pager.update_page(page_idx)?;
+                pager.lru_promotion(page_idx)?;
             }
         }
         Ok(())
@@ -417,6 +448,11 @@ impl Vmo_ {
         self.flags
     }
 
+    /// Returns the PageCacheManager of current VMO.
+    pub fn pager(&self) -> Option<Arc<PageCacheManager>> {
+        self.pager.clone()
+    }
+
     fn replace(&self, page: AnyFrame, page_idx: usize) -> Result<()> {
         self.pages.with(|pages, size| {
             if page_idx >= size / PAGE_SIZE {
@@ -437,6 +473,11 @@ impl<R> Vmo<R> {
     /// Returns the flags of a VMO.
     pub fn flags(&self) -> VmoFlags {
         self.0.flags()
+    }
+
+    /// Returns the pager of a VMO.
+    pub fn pager(&self) -> Option<Arc<PageCacheManager>> {
+        self.0.pager()
     }
 }
 
