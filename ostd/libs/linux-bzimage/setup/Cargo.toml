@@ -25,7 +25,7 @@ bitflags = "2.4.1"
 log = "0.4.20"
 uefi = "0.26.0"
 uefi-services = "0.23.0"
-x86_64 = "0.14.11"
+x86_64 = "=0.14.10"
 
 [features]
 default = []

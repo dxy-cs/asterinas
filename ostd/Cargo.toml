@@ -39,12 +39,12 @@ owo-colors = { version = "3", optional = true }
 ostd-pod = { git = "https://github.com/asterinas/ostd-pod", rev = "c4644be", version = "0.1.1" }
 spin = "0.9.4"
 static_assertions = "1.1.0"
-unwinding = { version = "0.2.2", default-features = false, features = ["fde-gnu-eh-frame-hdr", "hide-trace", "panic", "personality", "unwinder"] }
+unwinding = { version = "=0.2.2", default-features = false, features = ["fde-gnu-eh-frame-hdr", "hide-trace", "panic", "personality", "unwinder"] }
 volatile = { version = "0.4.5", features = ["unstable"] }
 xarray = { git = "https://github.com/asterinas/xarray", version = "0.1.0" }
 
 [target.x86_64-unknown-none.dependencies]
-x86_64 = "0.14.2"
+x86_64 = "=0.14.10"
 x86 = "0.52.0"
 acpi = "4.1.1"
 aml = "0.16.3"
