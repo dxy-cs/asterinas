@@ -96,11 +96,8 @@ impl VmoOptions<Rights> {
         let VmoOptions {
             size, flags, pager, ..
         } = self;
-        let mut vmo_ = alloc_vmo_(size, flags, pager)?;
-        let arc_vmo_ = Arc::new(vmo_);
-        let vmo_res = Vmo(arc_vmo_.clone(), Rights::all());
-        Arc::get_mut(&mut arc_vmo_).unwrap().vmoinvmo_ = Arc::downgrade(&Arc::new(vmo_res.clone()));
-        Ok(vmo_res)
+        let vmo_ = alloc_vmo_(size, flags, pager)?;
+        Ok(Vmo(Arc::new(vmo_), Rights::all()))
     }
 }
 
@@ -118,11 +115,8 @@ impl<R: TRights> VmoOptions<TRightSet<R>> {
             rights,
             pager,
         } = self;
-        let mut vmo_ = alloc_vmo_(size, flags, pager)?;
-        let arc_vmo_ = Arc::new(vmo_);
-        let c = Vmo(arc_vmo_.clone(), TRightSet(R::new()));
-        Arc::get_mut(&mut arc_vmo_).unwrap().vmoinvmo_ = Arc::downgrade(&Arc::new(vmo_res.clone()));
-        Ok(vmo_res)
+        let vmo_ = alloc_vmo_(size, flags, pager)?;
+        Ok(Vmo(Arc::new(vmo_), TRightSet(R::new())))
     }
 }
 
@@ -140,7 +134,6 @@ fn alloc_vmo_(size: usize, flags: VmoFlags, pager: Option<Arc<PageCacheManager>>
         pager,
         flags,
         pages,
-        vmoinvmo_: Weak::new(),
     })
 }
 

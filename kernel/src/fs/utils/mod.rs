@@ -13,7 +13,7 @@ pub use flock::{FlockItem, FlockList, FlockType};
 pub use fs::{FileSystem, FsFlags, SuperBlock};
 pub use inode::{Extension, Inode, InodeMode, InodeType, Metadata, MknodType};
 pub use ioctl::IoctlCmd;
-pub use page_cache::{PageCache, PageCacheManager,PageCacheBackend, CachePage};
+pub use page_cache::{CachePage, CachePageMeta, PageCache, PageCacheBackend, PageCacheManager};
 pub use random_test::{generate_random_operation, new_fs_in_memory};
 pub use range_lock::{
     FileRange, RangeLockItem, RangeLockItemBuilder, RangeLockList, RangeLockType, OFFSET_MAX,
