@@ -60,27 +60,21 @@ impl LRULists {
         }
     }
 
-    // Reclaim one page in the tail part of the inactive list@dxy
+    // Reclaim one page in the tail part of the inactive list
     fn reclaim(&mut self) {
-        // 1. while (size > capacity * threshold1) reclaim_one();
-        // 2. Look for the dirty info(page.PageState)
-        // page -> vmo -> pager(pagecachemanager) -> evict(dirty)
-        // page -> vmo -> pager(pagecachemanager) -> discard(dirty)
-        // 3. remove page(weak_ptr<vmo>)-> vmo ->page_ref
-        // page -> vmo.pages.remove_page()
-        // 4. remove page_ref in lrulists
-        // page -> lru_lists.remove_page()
-        // 5. size -= page.size()
-        // 6. inactive_size -= page.size()
-        //从尾部遍历inactive_list，直到找到一个metadata.is_mmapped == false的page
-        //将这个page从inactive_list中删除
-        //将这个page从page_cache中删除
-        //将这个page的size从size中减去
-        //将这个page的size从inactive_size中减去
+        /// 1. Trigger reclaim_one();
+        /// 2. Find a suitable page to reclaim(is_mapped == false)
+        /// 3. Look for the dirty info(page.PageState)
+        /// page -> vmo -> pager(pagecachemanager) -> evict(dirty)
+        /// page -> vmo -> pager(pagecachemanager) -> discard(dirty)
+        /// 4. Remove page in LruLists
+        /// 5. size -= page.size()
+        /// 6. [in]active_size -= page.size()
 
         
         let mut reclaimed = false;
         let mut cursor = self.inactive_list.back_mut();
+        /// Traverse the inactive_list from the end until finding a page with metadata.is_mmapped == false
         while let Some(node) = cursor.get() {
             if !node.page.metadata().is_mmapped.load(Ordering::Relaxed) {
                 let size = node.page.size();
@@ -107,7 +101,7 @@ impl LRULists {
             cursor.move_prev();
         }
         
-        //如果没有在while循环中找到合适的page，说明inactive_list中所有的page都是被mmap的，这时候去active_list中找一个删除
+        /// If no suitable page is found in inactive_list, find one in active_list to delete.
         if !reclaimed {
             let mut cursor = self.active_list.back_mut();
             while let Some(node) = cursor.get() {
@@ -144,8 +138,7 @@ impl LRULists {
 
     fn load_page(&mut self, page: CachePage) {
         //log::error!("Size:{}", self.size);
-        while self.size * 100 >= self.capacity * self.threshold1 {
-        //while mem_available() < 1024 * 1024 * 1024 /* 1024MB */ || self.size >= self.capacity {
+        while mem_available() < 1024 * 1024 * 1024 /* 1024MB */ || self.size >= self.capacity {
             self.reclaim();
             log::error!("Page Cache Size:{}", self.size);
         }
@@ -236,8 +229,7 @@ impl LRULists {
 }
 
 lazy_static! {
-    //pub static ref LRU_LISTS: Mutex<LRULists> = Mutex::new(LRULists::new(mem_available(), 90, 70));
-    pub static ref LRU_LISTS: Mutex<LRULists> = Mutex::new(LRULists::new(1 << 29, 70, 60));
+    pub static ref LRU_LISTS: Mutex<LRULists> = Mutex::new(LRULists::new(mem_available(), 90, 70));
 }
 
 pub struct PageCache {
