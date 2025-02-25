@@ -11,11 +11,11 @@ use align_ext::AlignExt;
 use aster_rights::Rights;
 use ostd::{
     collections::xarray::{CursorMut, XArray},
-    mm::{AnyFrame, FrameAllocOptions, UntypedPage, VmReader, VmWriter},
+    mm::{AnyFrame, FrameAllocOptions, HasPaddr, UntypedPage, VmReader, VmWriter},
 };
 
 use crate::{
-    fs::utils::{CachePage, PageCacheManager},
+    fs::utils::{CachePage, PageCacheManager, LruListNode, LRULists, LRU_LISTS},
     prelude::*,
 };
 
@@ -232,9 +232,31 @@ impl Vmo_ {
                 let mut reverse_map = page_tmp.metadata().reverse_map.write();
                 *reverse_map = Some(self.clone());
                 if (*reverse_map).is_none() {
+                    log::error!("1reverse map is none!");
                     return_errno!(Errno::EINVAL);
                 }
             }
+            // traverse the LRU list to find the page, check whether its reverse map has been assigned
+            let mut lru_lists = LRU_LISTS.lock();
+            let mut cursor = lru_lists.inactive_list.back_mut();
+            let mut found = false;
+            while let Some(node) = cursor.get() {
+                if node.page.paddr() == page_tmp.paddr() {
+                    found = true;
+                    // check whether the reverse map has been assigned
+                    let reverse_map = node.page.metadata().reverse_map.read();
+                    if reverse_map.is_none() {
+                        log::error!("2reverse map is none!");
+                        return_errno!(Errno::EINVAL);
+                    }
+                    break;
+                }
+                cursor.move_prev();
+            }
+            if !found {
+                return_errno!(Errno::EINVAL);
+            }
+
             Ok(page_tmp.into())
         } else {
             Ok(FrameAllocOptions::new().alloc_single(())?.into())

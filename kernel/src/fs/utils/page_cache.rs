@@ -13,21 +13,21 @@ use aster_block::bio::{BioStatus, BioWaiter};
 use aster_rights::Full;
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use lru::LruCache;
-use ostd::mm::{AnyFrame, Frame, FrameAllocOptions, HasPaddr, UntypedPage, VmIo};
+use ostd::mm::{stat::{self, mem_available}, AnyFrame, Frame, FrameAllocOptions, HasPaddr, UntypedPage, VmIo};
 
 use crate::{
     prelude::*,
     vm::vmo::{get_page_idx_range, Vmo, VmoFlags, VmoOptions, Vmo_},
 };
 
-struct LruListNode {
-    page: CachePage,
+pub struct LruListNode {
+    pub page: CachePage,
     link: LinkedListLink,
 }
 
-intrusive_adapter!(LruNodeAdapter = Box<LruListNode>: LruListNode { link: LinkedListLink });
+intrusive_adapter!(pub LruNodeAdapter = Box<LruListNode>: LruListNode { link: LinkedListLink });
 
-struct LRULists {
+pub struct LRULists {
     // MAX SIZE of FILE PAGES CACHE
     capacity: usize,
     // THRESHOLD FOR TRIGGERING RECLAIMATION
@@ -39,7 +39,7 @@ struct LRULists {
     // SIZE OF ACTIVE LIST
     active_size: usize,
     // LRU_INACTIVE_FILE
-    inactive_list: LinkedList<LruNodeAdapter>,
+    pub inactive_list: LinkedList<LruNodeAdapter>,
     // SIZE OF INACTIVE LIST
     inactive_size: usize,
     // SIZE OF ACTIVE + INACTIVE LIST
@@ -78,42 +78,15 @@ impl LRULists {
         //将这个page的size从size中减去
         //将这个page的size从inactive_size中减去
 
+        
+        let mut reclaimed = false;
         let mut cursor = self.inactive_list.back_mut();
         while let Some(node) = cursor.get() {
             if !node.page.metadata().is_mmapped.load(Ordering::Relaxed) {
                 let size = node.page.size();
                 //let pager = node.page.metadata().reverse_map.read().clone().unwrap().pager();
                 let reverse_map = node.page.metadata().reverse_map.read().clone();
-                if (reverse_map.is_none()) {
-                    continue;
-                }
-                let pager = reverse_map.unwrap().pager();
-                if node.page.metadata().state.load(Ordering::Relaxed) == PageState::Dirty {
-                    let _ = pager
-                            .unwrap()
-                            .evict_range(node.page.paddr()..node.page.paddr() + PAGE_SIZE);
-                } else {
-                    let _ = pager
-                            .unwrap()
-                            .discard_range(node.page.paddr()..node.page.paddr() + PAGE_SIZE);
-                }
-                self.size -= size;
-                self.inactive_size -= size;
-                cursor.remove();
-                break;
-            }
-            cursor.move_prev();
-        }
-        //如果没有在while循环中找到合适的page，说明inactive_list中所有的page都是被mmap的，这时候去active_list中找一个删除
-        if cursor.get().is_none() {
-            let mut cursor = self.active_list.back_mut();
-            while let Some(node) = cursor.get() {
-                if !node.page.metadata().is_mmapped.load(Ordering::Relaxed) {
-                    let size = node.page.size();
-                    let reverse_map = node.page.metadata().reverse_map.read().clone();
-                    if (reverse_map.is_none()) {
-                        continue;
-                    }
+                if !reverse_map.is_none() {
                     let pager = reverse_map.unwrap().pager();
                     if node.page.metadata().state.load(Ordering::Relaxed) == PageState::Dirty {
                         let _ = pager
@@ -125,14 +98,44 @@ impl LRULists {
                                 .discard_range(node.page.paddr()..node.page.paddr() + PAGE_SIZE);
                     }
                     self.size -= size;
-                    self.active_size -= size;
+                    self.inactive_size -= size;
                     cursor.remove();
+                    reclaimed = true;
                     break;
+                }
+            }
+            cursor.move_prev();
+        }
+        
+        //如果没有在while循环中找到合适的page，说明inactive_list中所有的page都是被mmap的，这时候去active_list中找一个删除
+        if !reclaimed {
+            let mut cursor = self.active_list.back_mut();
+            while let Some(node) = cursor.get() {
+                if !node.page.metadata().is_mmapped.load(Ordering::Relaxed) {
+                    let size = node.page.size();
+                    let reverse_map = node.page.metadata().reverse_map.read().clone();
+                    if !reverse_map.is_none() {
+                        let pager = reverse_map.unwrap().pager();
+                        if node.page.metadata().state.load(Ordering::Relaxed) == PageState::Dirty {
+                            let _ = pager
+                                    .unwrap()
+                                    .evict_range(node.page.paddr()..node.page.paddr() + PAGE_SIZE);
+                        } else {
+                            let _ = pager
+                                    .unwrap()
+                                    .discard_range(node.page.paddr()..node.page.paddr() + PAGE_SIZE);
+                        }
+                        self.size -= size;
+                        self.active_size -= size;
+                        cursor.remove();
+                        reclaimed = true;
+                        break;
+                    }
                 }
                 cursor.move_prev();
             }
 
-            if cursor.get().is_none() {
+            if !reclaimed {
                 panic!("No page to reclaim");
             }
         }
@@ -142,8 +145,9 @@ impl LRULists {
     fn load_page(&mut self, page: CachePage) {
         //log::error!("Size:{}", self.size);
         while self.size * 100 >= self.capacity * self.threshold1 {
+        //while mem_available() < 1024 * 1024 * 1024 /* 1024MB */ || self.size >= self.capacity {
             self.reclaim();
-            log::error!("Size:{}", self.size);
+            log::error!("Page Cache Size:{}", self.size);
         }
         let size = page.size();
         // Load page to the head of the inactive list
@@ -232,7 +236,8 @@ impl LRULists {
 }
 
 lazy_static! {
-    static ref LRU_LISTS: Mutex<LRULists> = Mutex::new(LRULists::new(1 << 29, 70, 60));
+    //pub static ref LRU_LISTS: Mutex<LRULists> = Mutex::new(LRULists::new(mem_available(), 90, 70));
+    pub static ref LRU_LISTS: Mutex<LRULists> = Mutex::new(LRULists::new(1 << 29, 70, 60));
 }
 
 pub struct PageCache {
