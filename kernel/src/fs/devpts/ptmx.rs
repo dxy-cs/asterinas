@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-#![allow(unused_variables)]
+#![expect(dead_code)]
+#![expect(unused_variables)]
 
 use super::*;
-use crate::{events::IoEvents, fs::inode_handle::FileIo, process::signal::Poller};
+use crate::{
+    events::IoEvents,
+    fs::inode_handle::FileIo,
+    process::signal::{PollHandle, Pollable},
+};
 
 /// Same major number with Linux.
 const PTMX_MAJOR_NUM: u32 = 5;
@@ -159,6 +163,10 @@ impl Inode for Ptmx {
     fn as_device(&self) -> Option<Arc<dyn Device>> {
         Some(Arc::new(self.inner.clone()))
     }
+
+    fn is_dentry_cacheable(&self) -> bool {
+        false
+    }
 }
 
 impl Device for Inner {
@@ -177,6 +185,12 @@ impl Device for Inner {
     }
 }
 
+impl Pollable for Inner {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        IoEvents::empty()
+    }
+}
+
 impl FileIo for Inner {
     fn read(&self, writer: &mut VmWriter) -> Result<usize> {
         return_errno_with_message!(Errno::EINVAL, "cannot read ptmx");
@@ -184,9 +198,5 @@ impl FileIo for Inner {
 
     fn write(&self, reader: &mut VmReader) -> Result<usize> {
         return_errno_with_message!(Errno::EINVAL, "cannot write ptmx");
-    }
-
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
-        IoEvents::empty()
     }
 }

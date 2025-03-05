@@ -5,18 +5,113 @@
 
 use std::{
     fs,
+    io::{Read, Result},
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 use crate::util::get_cargo_metadata;
 
+/// Compares two files byte-by-byte to check if they are identical.
+/// Returns `Ok(true)` if files are identical, `Ok(false)` if they are different, or `Err` if any I/O operation fails.
+fn are_files_identical(file1: &PathBuf, file2: &PathBuf) -> Result<bool> {
+    // Check file size first
+    let metadata1 = fs::metadata(file1)?;
+    let metadata2 = fs::metadata(file2)?;
+
+    if metadata1.len() != metadata2.len() {
+        return Ok(false); // Different sizes, not identical
+    }
+
+    // Compare file contents byte-by-byte
+    let mut file1 = fs::File::open(file1)?;
+    let mut file2 = fs::File::open(file2)?;
+
+    let mut buffer1 = [0u8; 4096];
+    let mut buffer2 = [0u8; 4096];
+
+    loop {
+        let bytes_read1 = file1.read(&mut buffer1)?;
+        let bytes_read2 = file2.read(&mut buffer2)?;
+
+        if bytes_read1 != bytes_read2 || buffer1[..bytes_read1] != buffer2[..bytes_read1] {
+            return Ok(false); // Files are different
+        }
+
+        if bytes_read1 == 0 {
+            return Ok(true); // End of both files, identical
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseCrateType {
+    /// The base crate is for running the target kernel crate.
+    Run,
+    /// The base crate is for testing the target crate.
+    Test,
+    /// The base crate is for other actions using Cargo.
+    Other,
+}
+
 /// Create a new base crate that will be built by cargo.
 ///
 /// The dependencies of the base crate will be the target crate. If
 /// `link_unit_test_runner` is set to true, the base crate will also depend on
 /// the `ostd-test-runner` crate.
+///
+/// It returns the path to the base crate.
 pub fn new_base_crate(
+    base_type: BaseCrateType,
+    base_crate_path_stem: impl AsRef<Path>,
+    dep_crate_name: &str,
+    dep_crate_path: impl AsRef<Path>,
+    link_unit_test_runner: bool,
+) -> PathBuf {
+    let base_crate_path: PathBuf = PathBuf::from(
+        (base_crate_path_stem.as_ref().as_os_str().to_string_lossy()
+            + match base_type {
+                BaseCrateType::Run => "-run-base",
+                BaseCrateType::Test => "-test-base",
+                BaseCrateType::Other => "-base",
+            })
+        .to_string(),
+    );
+    // Check if the existing crate base is reusable.
+    if base_type == BaseCrateType::Run && base_crate_path.exists() {
+        // Reuse the existing base crate if it is identical to the new one.
+        let base_crate_tmp_path = base_crate_path.join("tmp");
+        do_new_base_crate(
+            &base_crate_tmp_path,
+            dep_crate_name,
+            &dep_crate_path,
+            link_unit_test_runner,
+        );
+        let cargo_result = are_files_identical(
+            &base_crate_path.join("Cargo.toml"),
+            &base_crate_tmp_path.join("Cargo.toml"),
+        );
+        let main_rs_result = are_files_identical(
+            &base_crate_path.join("src").join("main.rs"),
+            &base_crate_tmp_path.join("src").join("main.rs"),
+        );
+        std::fs::remove_dir_all(&base_crate_tmp_path).unwrap();
+        if cargo_result.is_ok_and(|res| res) && main_rs_result.is_ok_and(|res| res) {
+            info!("Reusing existing base crate");
+            return base_crate_path;
+        }
+    }
+    do_new_base_crate(
+        &base_crate_path,
+        dep_crate_name,
+        dep_crate_path,
+        link_unit_test_runner,
+    );
+
+    base_crate_path
+}
+
+fn do_new_base_crate(
     base_crate_path: impl AsRef<Path>,
     dep_crate_name: &str,
     dep_crate_path: impl AsRef<Path>,
@@ -78,7 +173,7 @@ pub fn new_base_crate(
     }
     // TODO: currently just x86_64 works; add support for other architectures
     // here when OSTD is ready
-    include_linker_script!(["x86_64.ld"]);
+    include_linker_script!(["x86_64.ld", "riscv64.ld"]);
 
     // Overwrite the main.rs file
     let main_rs = include_str!("main.rs.template");

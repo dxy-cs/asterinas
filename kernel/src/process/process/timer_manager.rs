@@ -9,17 +9,15 @@ use core::time::Duration;
 
 use id_alloc::IdAlloc;
 use ostd::{
-    arch::{
-        timer::{self, TIMER_FREQ},
-        trap::is_kernel_interrupted,
-    },
+    arch::{timer::TIMER_FREQ, trap::is_kernel_interrupted},
     sync::Mutex,
+    timer,
 };
 
 use super::Process;
 use crate::{
     process::{
-        posix_thread::PosixThreadExt,
+        posix_thread::AsPosixThread,
         signal::{constants::SIGALRM, signals::kernel::KernelSignal},
     },
     thread::{
@@ -108,7 +106,7 @@ fn create_process_timer_callback(process_ref: &Weak<Process>) -> impl Fn() + Clo
     };
 
     let work_func = Box::new(sent_signal);
-    let work_item = Arc::new(WorkItem::new(work_func));
+    let work_item = WorkItem::new(work_func);
 
     move || {
         submit_work_item(

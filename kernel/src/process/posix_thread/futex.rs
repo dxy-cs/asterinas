@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListAtomicLink};
 use ostd::{
@@ -9,7 +9,7 @@ use ostd::{
 };
 use spin::Once;
 
-use crate::{prelude::*, process::Pid, time::wait::TimerBuilder};
+use crate::{prelude::*, process::Pid, time::wait::ManagedTimeout};
 
 type FutexBitSet = u32;
 type FutexBucketRef = Arc<Mutex<FutexBucket>>;
@@ -22,14 +22,14 @@ const FUTEX_BITSET_MATCH_ANY: FutexBitSet = 0xFFFF_FFFF;
 pub fn futex_wait(
     futex_addr: u64,
     futex_val: i32,
-    timer_builder: Option<TimerBuilder>,
+    timeout: Option<ManagedTimeout>,
     ctx: &Context,
     pid: Option<Pid>,
 ) -> Result<()> {
     futex_wait_bitset(
         futex_addr as _,
         futex_val,
-        timer_builder,
+        timeout,
         FUTEX_BITSET_MATCH_ANY,
         ctx,
         pid,
@@ -40,7 +40,7 @@ pub fn futex_wait(
 pub fn futex_wait_bitset(
     futex_addr: Vaddr,
     futex_val: i32,
-    timer_builder: Option<TimerBuilder>,
+    timeout: Option<ManagedTimeout>,
     bitset: FutexBitSet,
     ctx: &Context,
     pid: Option<Pid>,
@@ -73,7 +73,23 @@ pub fn futex_wait_bitset(
     // drop lock
     drop(futex_bucket);
 
-    waiter.pause_timer_timeout(timer_builder.as_ref())
+    let result = waiter.pause_timeout(&timeout.into());
+    match result {
+        // FIXME: If the futex is woken up and a signal comes at the same time, we should succeed
+        // instead of failing with `EINTR`. The code below is of course wrong, but was needed to
+        // make the gVisor tests happy. See <https://github.com/asterinas/asterinas/pull/1577>.
+        Err(err) if err.error() == Errno::EINTR => Ok(()),
+        res => res,
+    }
+
+    // TODO: Ensure the futex item is dequeued and dropped.
+    //
+    // The enqueued futex item remain undequeued
+    // if the futex wait operation is interrupted by a signal or times out.
+    // In such cases, the `Box<FutexItem>` would persist in memory,
+    // leaving our implementation vulnerable to exploitation by user programs
+    // that could repeatedly issue futex wait operations
+    // to exhaust kernel memory.
 }
 
 /// Does futex wake
@@ -164,7 +180,7 @@ static FUTEX_BUCKETS: Once<FutexBucketVec> = Once::new();
 /// This number is calculated the same way as Linux's:
 /// <https://github.com/torvalds/linux/blob/master/kernel/futex/core.c>
 fn get_bucket_count() -> usize {
-    ((1 << 8) * num_cpus()).next_power_of_two() as usize
+    ((1 << 8) * num_cpus()).next_power_of_two()
 }
 
 fn get_futex_bucket(key: FutexKey) -> (usize, FutexBucketRef) {
@@ -253,7 +269,9 @@ impl FutexBucket {
             }
 
             let item = item_cursor.remove().unwrap();
-            item.wake();
+            if !item.wake() {
+                continue;
+            }
             count += 1;
         }
 
@@ -323,8 +341,9 @@ impl FutexItem {
         (futex_item, waiter)
     }
 
-    pub fn wake(&self) {
-        self.waker.wake_up();
+    #[must_use]
+    pub fn wake(&self) -> bool {
+        self.waker.wake_up()
     }
 
     pub fn match_up(&self, another: &Self) -> bool {
@@ -350,7 +369,7 @@ impl FutexKey {
     pub fn load_val(&self, ctx: &Context) -> Result<i32> {
         // FIXME: how to implement a atomic load?
         warn!("implement an atomic load");
-        ctx.get_user_space().read_val(self.addr)
+        ctx.user_space().read_val(self.addr)
     }
 
     pub fn addr(&self) -> Vaddr {
@@ -370,7 +389,7 @@ impl FutexKey {
 // The implementation is from occlum
 
 #[derive(PartialEq, Debug, Clone, Copy)]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 pub enum FutexOp {
     FUTEX_WAIT = 0,
     FUTEX_WAKE = 1,

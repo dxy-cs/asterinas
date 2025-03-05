@@ -7,10 +7,10 @@ use super::{
     utils::{AccessMode, Channel, Consumer, InodeMode, InodeType, Metadata, Producer, StatusFlags},
 };
 use crate::{
-    events::{IoEvents, Observer},
+    events::IoEvents,
     prelude::*,
     process::{
-        signal::{Pollable, Poller},
+        signal::{PollHandle, Pollable},
         Gid, Uid,
     },
     time::clocks::RealTimeCoarseClock,
@@ -53,7 +53,7 @@ impl PipeReader {
 }
 
 impl Pollable for PipeReader {
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
         self.consumer.poll(mask, poller)
     }
 }
@@ -63,7 +63,7 @@ impl FileLike for PipeReader {
         let read_len = if self.status_flags().contains(StatusFlags::O_NONBLOCK) {
             self.consumer.try_read(writer)?
         } else {
-            self.wait_events(IoEvents::IN, || self.consumer.try_read(writer))?
+            self.wait_events(IoEvents::IN, None, || self.consumer.try_read(writer))?
         };
         Ok(read_len)
     }
@@ -84,6 +84,8 @@ impl FileLike for PipeReader {
     }
 
     fn metadata(&self) -> Metadata {
+        // This is a dummy implementation.
+        // TODO: Add "PipeFS" and link `PipeReader` to it.
         let now = RealTimeCoarseClock::get().read_time();
         Metadata {
             dev: 0,
@@ -101,21 +103,6 @@ impl FileLike for PipeReader {
             gid: Gid::new_root(),
             rdev: 0,
         }
-    }
-
-    fn register_observer(
-        &self,
-        observer: Weak<dyn Observer<IoEvents>>,
-        mask: IoEvents,
-    ) -> Result<()> {
-        self.consumer.register_observer(observer, mask)
-    }
-
-    fn unregister_observer(
-        &self,
-        observer: &Weak<dyn Observer<IoEvents>>,
-    ) -> Option<Weak<dyn Observer<IoEvents>>> {
-        self.consumer.unregister_observer(observer)
     }
 }
 
@@ -136,7 +123,7 @@ impl PipeWriter {
 }
 
 impl Pollable for PipeWriter {
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
         self.producer.poll(mask, poller)
     }
 }
@@ -146,7 +133,7 @@ impl FileLike for PipeWriter {
         if self.status_flags().contains(StatusFlags::O_NONBLOCK) {
             self.producer.try_write(reader)
         } else {
-            self.wait_events(IoEvents::OUT, || self.producer.try_write(reader))
+            self.wait_events(IoEvents::OUT, None, || self.producer.try_write(reader))
         }
     }
 
@@ -166,6 +153,8 @@ impl FileLike for PipeWriter {
     }
 
     fn metadata(&self) -> Metadata {
+        // This is a dummy implementation.
+        // TODO: Add "PipeFS" and link `PipeWriter` to it.
         let now = RealTimeCoarseClock::get().read_time();
         Metadata {
             dev: 0,
@@ -183,21 +172,6 @@ impl FileLike for PipeWriter {
             gid: Gid::new_root(),
             rdev: 0,
         }
-    }
-
-    fn register_observer(
-        &self,
-        observer: Weak<dyn Observer<IoEvents>>,
-        mask: IoEvents,
-    ) -> Result<()> {
-        self.producer.register_observer(observer, mask)
-    }
-
-    fn unregister_observer(
-        &self,
-        observer: &Weak<dyn Observer<IoEvents>>,
-    ) -> Option<Weak<dyn Observer<IoEvents>>> {
-        self.producer.unregister_observer(observer)
     }
 }
 
@@ -226,10 +200,7 @@ mod test {
     use super::*;
     use crate::{
         fs::utils::Channel,
-        thread::{
-            kernel_thread::{KernelThreadExt, ThreadOptions},
-            Thread,
-        },
+        thread::{kernel_thread::ThreadOptions, Thread},
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,27 +211,19 @@ mod test {
 
     fn test_blocking<W, R>(write: W, read: R, ordering: Ordering)
     where
-        W: Fn(Arc<PipeWriter>) + Sync + Send + 'static,
-        R: Fn(Arc<PipeReader>) + Sync + Send + 'static,
+        W: FnOnce(Arc<PipeWriter>) + Send + 'static,
+        R: FnOnce(Arc<PipeReader>) + Send + 'static,
     {
-        let channel = Channel::with_capacity(1);
+        let channel = Channel::with_capacity(2);
         let (writer, readr) = channel.split();
 
         let writer = PipeWriter::new(writer, StatusFlags::empty()).unwrap();
         let reader = PipeReader::new(readr, StatusFlags::empty()).unwrap();
 
-        // FIXME: `ThreadOptions::new` currently accepts `Fn`, forcing us to use `SpinLock` to gain
-        // internal mutability. We should avoid this `SpinLock` by making `ThreadOptions::new`
-        // accept `FnOnce`.
-        let writer_with_lock: SpinLock<_> = SpinLock::new(Some(writer));
-        let reader_with_lock: SpinLock<_> = SpinLock::new(Some(reader));
-
         let signal_writer = Arc::new(AtomicBool::new(false));
         let signal_reader = signal_writer.clone();
 
-        let writer = Thread::spawn_kernel_thread(ThreadOptions::new(move || {
-            let writer = writer_with_lock.lock().take().unwrap();
-
+        let writer = ThreadOptions::new(move || {
             if ordering == Ordering::ReadThenWrite {
                 while !signal_writer.load(atomic::Ordering::Relaxed) {
                     Thread::yield_now();
@@ -270,11 +233,10 @@ mod test {
             }
 
             write(writer);
-        }));
+        })
+        .spawn();
 
-        let reader = Thread::spawn_kernel_thread(ThreadOptions::new(move || {
-            let reader = reader_with_lock.lock().take().unwrap();
-
+        let reader = ThreadOptions::new(move || {
             if ordering == Ordering::WriteThenRead {
                 while !signal_reader.load(atomic::Ordering::Relaxed) {
                     Thread::yield_now();
@@ -284,7 +246,8 @@ mod test {
             }
 
             read(reader);
-        }));
+        })
+        .spawn();
 
         writer.join();
         reader.join();
@@ -309,13 +272,13 @@ mod test {
     fn test_write_full() {
         test_blocking(
             |writer| {
-                assert_eq!(writer.write(&mut reader_from(&[1, 2])).unwrap(), 1);
+                assert_eq!(writer.write(&mut reader_from(&[1, 2, 3])).unwrap(), 2);
                 assert_eq!(writer.write(&mut reader_from(&[2])).unwrap(), 1);
             },
             |reader| {
-                let mut buf = [0; 2];
-                assert_eq!(reader.read(&mut writer_from(&mut buf)).unwrap(), 1);
-                assert_eq!(&buf[..1], &[1]);
+                let mut buf = [0; 3];
+                assert_eq!(reader.read(&mut writer_from(&mut buf)).unwrap(), 2);
+                assert_eq!(&buf[..2], &[1, 2]);
                 assert_eq!(reader.read(&mut writer_from(&mut buf)).unwrap(), 1);
                 assert_eq!(&buf[..1], &[2]);
             },
@@ -339,13 +302,31 @@ mod test {
     fn test_write_closed() {
         test_blocking(
             |writer| {
-                assert_eq!(writer.write(&mut reader_from(&[1, 2])).unwrap(), 1);
+                assert_eq!(writer.write(&mut reader_from(&[1, 2, 3])).unwrap(), 2);
                 assert_eq!(
                     writer.write(&mut reader_from(&[2])).unwrap_err().error(),
                     Errno::EPIPE
                 );
             },
             drop,
+            Ordering::WriteThenRead,
+        );
+    }
+
+    #[ktest]
+    fn test_write_atomicity() {
+        test_blocking(
+            |writer| {
+                assert_eq!(writer.write(&mut reader_from(&[1])).unwrap(), 1);
+                assert_eq!(writer.write(&mut reader_from(&[1, 2])).unwrap(), 2);
+            },
+            |reader| {
+                let mut buf = [0; 3];
+                assert_eq!(reader.read(&mut writer_from(&mut buf)).unwrap(), 1);
+                assert_eq!(&buf[..1], &[1]);
+                assert_eq!(reader.read(&mut writer_from(&mut buf)).unwrap(), 2);
+                assert_eq!(&buf[..2], &[1, 2]);
+            },
             Ordering::WriteThenRead,
         );
     }

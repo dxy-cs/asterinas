@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use alloc::collections::BTreeMap;
 use core::mem::size_of;
 
-use log::warn;
 use ostd_pod::Pod;
 
 use super::second_stage::{DeviceMode, PageTableEntry, PagingConsts};
@@ -15,7 +14,7 @@ use crate::{
         dma::Daddr,
         page_prop::{CachePolicy, PageProperty, PrivilegedPageFlags as PrivFlags},
         page_table::{PageTableError, PageTableItem},
-        Frame, FrameAllocOptions, Paddr, PageFlags, PageTable, UntypedPage, VmIo, PAGE_SIZE,
+        Frame, FrameAllocOptions, Paddr, PageFlags, PageTable, VmIo, PAGE_SIZE,
     },
 };
 
@@ -38,7 +37,7 @@ impl RootEntry {
 
 pub struct RootTable {
     /// Total 256 bus, each entry is 128 bits.
-    root_frame: Frame,
+    root_frame: Frame<()>,
     // TODO: Use radix tree instead.
     context_tables: BTreeMap<Paddr, ContextTable>,
 }
@@ -57,7 +56,7 @@ impl RootTable {
 
     pub(super) fn new() -> Self {
         Self {
-            root_frame: FrameAllocOptions::new().alloc_single(()).unwrap(),
+            root_frame: FrameAllocOptions::new().alloc_frame().unwrap(),
             context_tables: BTreeMap::new(),
         }
     }
@@ -98,7 +97,7 @@ impl RootTable {
         Ok(())
     }
 
-    /// Specify the device page table instead of creating a page table if not exists.
+    /// Specifies the device page table instead of creating a page table if not exists.
     ///
     /// This will be useful if we want all the devices to use the same page table.
     /// The original page table will be overwritten.
@@ -116,9 +115,12 @@ impl RootTable {
                     * size_of::<ContextEntry>(),
             )
             .unwrap();
+
         if bus_entry.is_present() {
-            warn!("IOMMU: Overwriting the existing device page table");
+            panic!("existing device page tables should not be overridden");
         }
+
+        // Activate page table.
         let address = unsafe { page_table.root_paddr() };
         context_table.page_tables.insert(address, page_table);
         let entry = ContextEntry(address as u128 | 1 | 0x1_0000_0000_0000_0000);
@@ -130,7 +132,6 @@ impl RootTable {
                 &entry,
             )
             .unwrap();
-        context_table.page_tables.get_mut(&address).unwrap();
     }
 
     fn get_or_create_context_table(&mut self, device_id: PciDeviceLocation) -> &mut ContextTable {
@@ -195,7 +196,7 @@ impl ContextEntry {
         }
     }
 
-    /// Get the second stage page translation pointer.
+    /// Gets the second stage page translation pointer.
     ///
     /// This function will not right shift the value after the `and` operation.
     pub const fn second_stage_pointer(&self) -> u64 {
@@ -236,14 +237,14 @@ pub enum AddressWidth {
 
 pub struct ContextTable {
     /// Total 32 devices, each device has 8 functions.
-    entries_frame: Frame,
+    entries_frame: Frame<()>,
     page_tables: BTreeMap<Paddr, PageTable<DeviceMode, PageTableEntry, PagingConsts>>,
 }
 
 impl ContextTable {
     fn new() -> Self {
         Self {
-            entries_frame: FrameAllocOptions::new().alloc_single(()).unwrap(),
+            entries_frame: FrameAllocOptions::new().alloc_frame().unwrap(),
             page_tables: BTreeMap::new(),
         }
     }

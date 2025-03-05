@@ -3,12 +3,11 @@
 use aster_bigtcp::{
     errors::BindError,
     iface::BindPortConfig,
-    socket::AnyUnboundSocket,
     wire::{IpAddress, IpEndpoint},
 };
 
 use crate::{
-    net::iface::{AnyBoundSocket, Iface, IFACES},
+    net::iface::{BoundPort, Iface, IFACES},
     prelude::*,
 };
 
@@ -46,27 +45,20 @@ fn get_ephemeral_iface(remote_ip_addr: &IpAddress) -> Arc<Iface> {
     ifaces[0].clone()
 }
 
-pub(super) fn bind_socket(
-    unbound_socket: Box<AnyUnboundSocket>,
-    endpoint: &IpEndpoint,
-    can_reuse: bool,
-) -> core::result::Result<AnyBoundSocket, (Error, Box<AnyUnboundSocket>)> {
+pub(super) fn bind_port(endpoint: &IpEndpoint, can_reuse: bool) -> Result<BoundPort> {
     let iface = match get_iface_to_bind(&endpoint.addr) {
         Some(iface) => iface,
         None => {
-            let err = Error::with_message(
+            return_errno_with_message!(
                 Errno::EADDRNOTAVAIL,
-                "the address is not available from the local machine",
+                "the address is not available from the local machine"
             );
-            return Err((err, unbound_socket));
         }
     };
 
     let bind_port_config = BindPortConfig::new(endpoint.port, can_reuse);
 
-    iface
-        .bind_socket(unbound_socket, bind_port_config)
-        .map_err(|(err, unbound)| (err.into(), unbound))
+    Ok(iface.bind(bind_port_config)?)
 }
 
 impl From<BindError> for Error {

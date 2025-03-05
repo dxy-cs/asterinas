@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-pub mod priority;
-mod priority_scheduler;
+mod nice;
+mod sched_class;
+mod stats;
 
-// There may be multiple scheduling policies in the system,
-// and subsequent schedulers can be placed under this module.
-pub use self::priority_scheduler::init;
+pub use self::{
+    nice::{AtomicNice, Nice},
+    sched_class::{init, SchedAttr, SchedPolicy},
+    stats::{loadavg, nr_queued_and_running},
+};

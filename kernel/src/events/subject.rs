@@ -3,6 +3,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use keyable_arc::KeyableWeak;
+use ostd::sync::LocalIrqDisabled;
 
 use super::{Events, EventsFilter, Observer};
 use crate::prelude::*;
@@ -10,7 +11,7 @@ use crate::prelude::*;
 /// A Subject notifies interesting events to registered observers.
 pub struct Subject<E: Events, F: EventsFilter<E> = ()> {
     // A table that maintains all interesting observers.
-    observers: SpinLock<BTreeMap<KeyableWeak<dyn Observer<E>>, F>>,
+    observers: SpinLock<BTreeMap<KeyableWeak<dyn Observer<E>>, F>, LocalIrqDisabled>,
     // To reduce lock contentions, we maintain a counter for the size of the table
     num_observers: AtomicUsize,
 }
@@ -22,6 +23,7 @@ impl<E: Events, F: EventsFilter<E>> Subject<E, F> {
             num_observers: AtomicUsize::new(0),
         }
     }
+
     /// Register an observer.
     ///
     /// A registered observer will get notified through its `on_events` method.
@@ -36,7 +38,8 @@ impl<E: Events, F: EventsFilter<E>> Subject<E, F> {
             observers.insert(observer, filter).is_none()
         };
         if is_new {
-            self.num_observers.fetch_add(1, Ordering::Relaxed);
+            // This `Acquire` pairs with the `Release` in `notify_observers`.
+            self.num_observers.fetch_add(1, Ordering::Acquire);
         }
     }
 
@@ -65,7 +68,11 @@ impl<E: Events, F: EventsFilter<E>> Subject<E, F> {
     /// It will remove the observers which have been freed.
     pub fn notify_observers(&self, events: &E) {
         // Fast path.
-        if self.num_observers.load(Ordering::Relaxed) == 0 {
+        //
+        // Note: This must use `Release`, which pairs with `Acquire` in `register_observer`, to
+        // ensure that even if this fast path is used, a concurrently registered observer will see
+        // the event we want to notify.
+        if self.num_observers.fetch_add(0, Ordering::Release) == 0 {
             return;
         }
 

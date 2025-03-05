@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
+#![expect(dead_code)]
 
-use ostd::{cpu::CpuSet, task::Task};
+use ostd::{
+    cpu::{CpuId, CpuSet},
+    task::Task,
+};
 
 use super::worker_pool::WorkerPool;
 use crate::{
     prelude::*,
-    sched::priority::{Priority, PriorityRange},
-    thread::kernel_thread::{create_new_kernel_task, ThreadOptions},
-    Thread,
+    sched::{Nice, SchedPolicy},
+    thread::{kernel_thread::ThreadOptions, AsThread},
 };
 
 /// A worker thread. A `Worker` will attempt to retrieve unfinished
@@ -19,7 +21,7 @@ use crate::{
 pub(super) struct Worker {
     worker_pool: Weak<WorkerPool>,
     bound_task: Arc<Task>,
-    bound_cpu: u32,
+    bound_cpu: CpuId,
     inner: SpinLock<WorkerInner>,
 }
 
@@ -39,7 +41,7 @@ enum WorkerStatus {
 
 impl Worker {
     /// Creates a new `Worker` to the given `worker_pool`.
-    pub(super) fn new(worker_pool: Weak<WorkerPool>, bound_cpu: u32) -> Arc<Self> {
+    pub(super) fn new(worker_pool: Weak<WorkerPool>, bound_cpu: CpuId) -> Arc<Self> {
         Arc::new_cyclic(|worker_ref| {
             let weal_worker = worker_ref.clone();
             let task_fn = Box::new(move || {
@@ -48,16 +50,16 @@ impl Worker {
             });
             let mut cpu_affinity = CpuSet::new_empty();
             cpu_affinity.add(bound_cpu);
-            let mut priority = Priority::default();
-            if worker_pool.upgrade().unwrap().is_high_priority() {
-                // FIXME: remove the use of real-time priority.
-                priority = Priority::new(PriorityRange::new(0));
-            }
-            let bound_task = create_new_kernel_task(
-                ThreadOptions::new(task_fn)
-                    .cpu_affinity(cpu_affinity)
-                    .priority(priority),
-            );
+            let sched_policy =
+                SchedPolicy::Fair(if worker_pool.upgrade().unwrap().is_high_priority() {
+                    Nice::MIN
+                } else {
+                    Nice::default()
+                });
+            let bound_task = ThreadOptions::new(task_fn)
+                .cpu_affinity(cpu_affinity)
+                .sched_policy(sched_policy)
+                .build();
             Self {
                 worker_pool,
                 bound_task,
@@ -70,7 +72,7 @@ impl Worker {
     }
 
     pub(super) fn run(&self) {
-        let thread = Thread::borrow_from_task(&self.bound_task);
+        let thread = self.bound_task.as_thread().unwrap();
         thread.run();
     }
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-pub use smoltcp::phy::{Device, DeviceCapabilities, Loopback, Medium, RxToken, TxToken};
+pub use smoltcp::phy::{
+    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Loopback, Medium, RxToken, TxToken,
+};
 
 /// A trait that allows to obtain a mutable reference of [`Device`].
 ///
@@ -15,4 +17,10 @@ pub trait WithDevice: Send + Sync {
     fn with<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Self::Device) -> R;
+}
+
+/// A trait for notifying device drivers about the polling process.
+pub trait NotifyDevice {
+    /// Notifies the device driver that polling has ended.
+    fn notify_poll_end(&mut self);
 }

@@ -32,7 +32,7 @@ pub enum ProjectType {
 /// The osdk manifest from configuration file `OSDK.toml`.
 #[derive(Debug, Clone)]
 pub struct TomlManifest {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub project_type: Option<ProjectType>,
     pub default_scheme: Scheme,
     pub map: HashMap<String, Scheme>,
@@ -168,7 +168,7 @@ impl<'de> Deserialize<'de> for TomlManifest {
             {
                 struct FieldVisitor;
 
-                impl<'de> de::Visitor<'de> for FieldVisitor {
+                impl de::Visitor<'_> for FieldVisitor {
                     type Value = Field;
 
                     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {

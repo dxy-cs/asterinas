@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-#![allow(unused_variables)]
+#![expect(dead_code)]
+#![expect(unused_variables)]
 
 use super::*;
 use crate::{
-    device::PtySlave, events::IoEvents, fs::inode_handle::FileIo, process::signal::Poller,
+    device::PtySlave,
+    events::IoEvents,
+    fs::inode_handle::FileIo,
+    process::signal::{PollHandle, Pollable},
 };
 
 /// Same major number with Linux, the minor number is the index of slave.
@@ -133,7 +136,7 @@ impl Inode for PtySlaveInode {
         self.device.ioctl(cmd, arg)
     }
 
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
         self.device.poll(mask, poller)
     }
 

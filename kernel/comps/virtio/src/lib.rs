@@ -3,7 +3,6 @@
 //! The virtio of Asterinas.
 #![no_std]
 #![deny(unsafe_code)]
-#![allow(dead_code)]
 #![feature(trait_alias)]
 #![feature(fn_traits)]
 #![feature(linked_list_cursors)]
@@ -11,6 +10,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use core::hint::spin_loop;
 
 use bitflags::bitflags;
 use component::{init_component, ComponentInitError};
@@ -40,20 +40,27 @@ fn virtio_component_init() -> Result<(), ComponentInitError> {
     socket::init();
     while let Some(mut transport) = pop_device_transport() {
         // Reset device
-        transport.set_device_status(DeviceStatus::empty()).unwrap();
+        transport
+            .write_device_status(DeviceStatus::empty())
+            .unwrap();
+        while transport.read_device_status() != DeviceStatus::empty() {
+            spin_loop();
+        }
+
         // Set to acknowledge
         transport
-            .set_device_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER)
+            .write_device_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER)
             .unwrap();
         // negotiate features
         negotiate_features(&mut transport);
 
-        // change to features ok status
-        transport
-            .set_device_status(
-                DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK,
-            )
-            .unwrap();
+        if !transport.is_legacy_version() {
+            // change to features ok status
+            let status =
+                DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK;
+            transport.write_device_status(status).unwrap();
+        }
+
         let device_type = transport.device_type();
         let res = match transport.device_type() {
             VirtioDeviceType::Block => BlockDevice::init(transport),
@@ -78,7 +85,7 @@ fn virtio_component_init() -> Result<(), ComponentInitError> {
 
 fn pop_device_transport() -> Option<Box<dyn VirtioTransport>> {
     if let Some(device) = VIRTIO_PCI_DRIVER.get().unwrap().pop_device_transport() {
-        return Some(Box::new(device));
+        return Some(device);
     }
     if let Some(device) = VIRTIO_MMIO_DRIVER.get().unwrap().pop_device_transport() {
         return Some(Box::new(device));
@@ -87,7 +94,7 @@ fn pop_device_transport() -> Option<Box<dyn VirtioTransport>> {
 }
 
 fn negotiate_features(transport: &mut Box<dyn VirtioTransport>) {
-    let features = transport.device_features();
+    let features = transport.read_device_features();
     let mask = ((1u64 << 24) - 1) | (((1u64 << 24) - 1) << 50);
     let device_specified_features = features & mask;
     let device_support_features = match transport.device_type() {
@@ -101,7 +108,7 @@ fn negotiate_features(transport: &mut Box<dyn VirtioTransport>) {
     let mut support_feature = Feature::from_bits_truncate(features);
     support_feature.remove(Feature::RING_EVENT_IDX);
     transport
-        .set_driver_features(features & (support_feature.bits | device_support_features))
+        .write_driver_features(features & (support_feature.bits | device_support_features))
         .unwrap();
 }
 

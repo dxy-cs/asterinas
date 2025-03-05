@@ -6,11 +6,8 @@ use aster_bigtcp::device::WithDevice;
 use ostd::sync::LocalIrqDisabled;
 use spin::Once;
 
-use super::{poll_ifaces, Iface};
-use crate::{
-    net::iface::ext::{IfaceEx, IfaceExt},
-    prelude::*,
-};
+use super::{poll::poll_ifaces, Iface};
+use crate::{net::iface::sched::PollScheduler, prelude::*};
 
 pub static IFACES: Once<Vec<Arc<Iface>>> = Once::new();
 
@@ -22,11 +19,13 @@ pub fn init() {
     });
 
     for (name, _) in aster_network::all_devices() {
-        aster_network::register_recv_callback(&name, || {
+        let callback = || {
             // TODO: further check that the irq num is the same as iface's irq num
             let iface_virtio = &IFACES.get().unwrap()[0];
             iface_virtio.poll();
-        })
+        };
+        aster_network::register_recv_callback(&name, callback);
+        aster_network::register_send_callback(&name, callback);
     }
 
     poll_ifaces();
@@ -67,7 +66,8 @@ fn new_virtio() -> Arc<Iface> {
         EthernetAddress(ether_addr),
         Ipv4Cidr::new(VIRTIO_ADDRESS, VIRTIO_ADDRESS_PREFIX_LEN),
         VIRTIO_GATEWAY,
-        IfaceExt::new("virtio".to_owned()),
+        "virtio".to_owned(),
+        PollScheduler::new(),
     )
 }
 
@@ -98,6 +98,7 @@ fn new_loopback() -> Arc<Iface> {
     IpIface::new(
         Wrapper(Mutex::new(Loopback::new(Medium::Ip))),
         Ipv4Cidr::new(LOOPBACK_ADDRESS, LOOPBACK_ADDRESS_PREFIX_LEN),
-        IfaceExt::new("lo".to_owned()),
+        "lo".to_owned(),
+        PollScheduler::new(),
     ) as _
 }

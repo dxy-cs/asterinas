@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(unused_variables)]
+#![expect(unused_variables)]
 
 //! Options for allocating root and child VMOs.
 
@@ -8,7 +8,7 @@ use align_ext::AlignExt;
 use aster_rights::{Rights, TRightSet, TRights};
 use ostd::{
     collections::xarray::XArray,
-    mm::{AnyFrame, FrameAllocOptions},
+    mm::{FrameAllocOptions, UFrame, USegment},
 };
 
 use super::{Pages, Vmo, VmoFlags};
@@ -137,14 +137,14 @@ fn alloc_vmo_(size: usize, flags: VmoFlags, pager: Option<Arc<PageCacheManager>>
     })
 }
 
-fn committed_pages_if_continuous(flags: VmoFlags, size: usize) -> Result<XArray<AnyFrame>> {
+fn committed_pages_if_continuous(flags: VmoFlags, size: usize) -> Result<XArray<UFrame>> {
     if flags.contains(VmoFlags::CONTIGUOUS) {
         // if the vmo is continuous, we need to allocate frames for the vmo
         let frames_num = size / PAGE_SIZE;
-        let frames = FrameAllocOptions::new().alloc_contiguous(frames_num, |_| ())?;
+        let segment: USegment = FrameAllocOptions::new().alloc_segment(frames_num)?.into();
         let mut committed_pages = XArray::new();
         let mut cursor = committed_pages.cursor_mut(0);
-        for frame in frames {
+        for frame in segment {
             cursor.store(frame);
             cursor.next();
         }

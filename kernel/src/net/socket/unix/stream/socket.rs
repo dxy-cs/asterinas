@@ -10,15 +10,16 @@ use super::{
     listener::{get_backlog, Backlog, Listener},
 };
 use crate::{
-    events::{IoEvents, Observer},
-    fs::{file_handle::FileLike, utils::StatusFlags},
+    events::IoEvents,
+    fs::file_handle::FileLike,
     net::socket::{
+        private::SocketPrivate,
         unix::UnixSocketAddr,
         util::{send_recv_flags::SendRecvFlags, socket_addr::SocketAddr, MessageHeader},
         SockShutdownCmd, Socket,
     },
     prelude::*,
-    process::signal::{Pollable, Poller},
+    process::signal::{PollHandle, Pollable},
     util::{MultiRead, MultiWrite},
 };
 
@@ -62,28 +63,12 @@ impl UnixStreamSocket {
         )
     }
 
-    fn send(&self, reader: &mut dyn MultiRead, flags: SendRecvFlags) -> Result<usize> {
-        if self.is_nonblocking() {
-            self.try_send(reader, flags)
-        } else {
-            self.wait_events(IoEvents::OUT, || self.try_send(reader, flags))
-        }
-    }
-
     fn try_send(&self, buf: &mut dyn MultiRead, _flags: SendRecvFlags) -> Result<usize> {
         match self.state.read().as_ref() {
             State::Connected(connected) => connected.try_write(buf),
             State::Init(_) | State::Listen(_) => {
                 return_errno_with_message!(Errno::ENOTCONN, "the socket is not connected")
             }
-        }
-    }
-
-    fn recv(&self, writer: &mut dyn MultiWrite, flags: SendRecvFlags) -> Result<usize> {
-        if self.is_nonblocking() {
-            self.try_recv(writer, flags)
-        } else {
-            self.wait_events(IoEvents::IN, || self.try_recv(writer, flags))
         }
     }
 
@@ -139,18 +124,10 @@ impl UnixStreamSocket {
             }
         }
     }
-
-    fn is_nonblocking(&self) -> bool {
-        self.is_nonblocking.load(Ordering::Relaxed)
-    }
-
-    fn set_nonblocking(&self, nonblocking: bool) {
-        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
-    }
 }
 
 impl Pollable for UnixStreamSocket {
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
         let inner = self.state.read();
         match inner.as_ref() {
             State::Init(init) => init.poll(mask, poller),
@@ -160,58 +137,13 @@ impl Pollable for UnixStreamSocket {
     }
 }
 
-impl FileLike for UnixStreamSocket {
-    fn as_socket(self: Arc<Self>) -> Option<Arc<dyn Socket>> {
-        Some(self)
+impl SocketPrivate for UnixStreamSocket {
+    fn is_nonblocking(&self) -> bool {
+        self.is_nonblocking.load(Ordering::Relaxed)
     }
 
-    fn read(&self, writer: &mut VmWriter) -> Result<usize> {
-        // TODO: Set correct flags
-        let flags = SendRecvFlags::empty();
-        let read_len = self.recv(writer, flags)?;
-        Ok(read_len)
-    }
-
-    fn write(&self, reader: &mut VmReader) -> Result<usize> {
-        // TODO: Set correct flags
-        let flags = SendRecvFlags::empty();
-        self.send(reader, flags)
-    }
-
-    fn status_flags(&self) -> StatusFlags {
-        if self.is_nonblocking() {
-            StatusFlags::O_NONBLOCK
-        } else {
-            StatusFlags::empty()
-        }
-    }
-
-    fn set_status_flags(&self, new_flags: StatusFlags) -> Result<()> {
-        self.set_nonblocking(new_flags.contains(StatusFlags::O_NONBLOCK));
-        Ok(())
-    }
-
-    fn register_observer(
-        &self,
-        observer: Weak<dyn Observer<IoEvents>>,
-        mask: IoEvents,
-    ) -> Result<()> {
-        match self.state.read().as_ref() {
-            State::Init(init) => init.register_observer(observer, mask),
-            State::Listen(listen) => listen.register_observer(observer, mask),
-            State::Connected(connected) => connected.register_observer(observer, mask),
-        }
-    }
-
-    fn unregister_observer(
-        &self,
-        observer: &Weak<dyn Observer<IoEvents>>,
-    ) -> Option<Weak<dyn Observer<IoEvents>>> {
-        match self.state.read().as_ref() {
-            State::Init(init) => init.unregister_observer(observer),
-            State::Listen(listen) => listen.unregister_observer(observer),
-            State::Connected(connected) => connected.unregister_observer(observer),
-        }
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
     }
 }
 
@@ -280,11 +212,7 @@ impl Socket for UnixStreamSocket {
     }
 
     fn accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
-        if self.is_nonblocking() {
-            self.try_accept()
-        } else {
-            self.wait_events(IoEvents::IN, || self.try_accept())
-        }
+        self.block_on(IoEvents::IN, || self.try_accept())
     }
 
     fn shutdown(&self, cmd: SockShutdownCmd) -> Result<()> {
@@ -325,7 +253,9 @@ impl Socket for UnixStreamSocket {
         flags: SendRecvFlags,
     ) -> Result<usize> {
         // TODO: Deal with flags
-        debug_assert!(flags.is_all_supported());
+        if !flags.is_all_supported() {
+            warn!("unsupported flags: {:?}", flags);
+        }
 
         let MessageHeader {
             control_message, ..
@@ -336,7 +266,7 @@ impl Socket for UnixStreamSocket {
             warn!("sending control message is not supported");
         }
 
-        self.send(reader, flags)
+        self.block_on(IoEvents::OUT, || self.try_send(reader, flags))
     }
 
     fn recvmsg(
@@ -345,9 +275,11 @@ impl Socket for UnixStreamSocket {
         flags: SendRecvFlags,
     ) -> Result<(usize, MessageHeader)> {
         // TODO: Deal with flags
-        debug_assert!(flags.is_all_supported());
+        if !flags.is_all_supported() {
+            warn!("unsupported flags: {:?}", flags);
+        }
 
-        let received_bytes = self.recv(writer, flags)?;
+        let received_bytes = self.block_on(IoEvents::IN, || self.try_recv(writer, flags))?;
 
         // TODO: Receive control message
 

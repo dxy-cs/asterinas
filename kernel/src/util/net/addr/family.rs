@@ -5,15 +5,14 @@ use core::cmp::min;
 use ostd::task::Task;
 
 use super::{ip::CSocketAddrInet, unix, vsock::CSocketAddrVm};
-use crate::{get_current_userspace, net::socket::SocketAddr, prelude::*};
+use crate::{current_userspace, net::socket::SocketAddr, prelude::*};
 
 /// Address family.
 ///
 /// See <https://elixir.bootlin.com/linux/v6.0.9/source/include/linux/socket.h>.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, TryFromInt, PartialEq, Eq)]
-#[allow(non_camel_case_types)]
-#[allow(dead_code)]
+#[expect(non_camel_case_types)]
 pub enum CSocketAddrFamily {
     AF_UNSPEC = 0,
     /// Unix domain sockets
@@ -146,7 +145,7 @@ pub fn read_socket_addr_from_user(addr: Vaddr, addr_len: usize) -> Result<Socket
     }
 
     let mut storage = Storage::new_zeroed();
-    get_current_userspace!().read_bytes(
+    current_userspace!().read_bytes(
         addr,
         &mut VmWriter::from(&mut storage.as_bytes_mut()[..addr_len]),
     )?;

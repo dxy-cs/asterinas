@@ -8,10 +8,15 @@ ethe = "ethe"
 mke  = "mke"
 WHT  = "WHT"
 ist  = "ist"
+sie  = "sie"
 TME  = "TME"
 BA   = "BA"
 ND   = "ND"
 Fo   = "Fo"
+Inh  = "Inh"
+DELET = "DELET"
+wrk = "wrk"
+rto = "rto"
 
 # Files with svg suffix are ignored to check. 
 [type.svg]

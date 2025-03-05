@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-#![allow(unused_variables)]
+#![expect(dead_code)]
 
 //! This module is used to parse elf file content to get elf_load_info.
 //! When create a process from elf file, we will use the elf_load_info to construct the VmSpace
 
 use align_ext::AlignExt;
 use aster_rights::Full;
-use ostd::mm::{FrameAllocOptions, UntypedPage};
+use ostd::mm::{FrameAllocOptions, UntypedMem};
 use xmas_elf::program::{self, ProgramHeader64};
 
 use super::elf_file::Elf;
@@ -19,7 +18,7 @@ use crate::{
     },
     prelude::*,
     process::{
-        do_exit_group,
+        posix_thread::do_exit_group,
         process_vm::{AuxKey, AuxVec, ProcessVm},
         TermStatus,
     },
@@ -27,14 +26,14 @@ use crate::{
     vm::{perms::VmPerms, vmar::Vmar, vmo::VmoRightsOp},
 };
 
-/// Loads elf to the process vm.   
+/// Loads elf to the process vm.
 ///
 /// This function will map elf segments and
 /// initialize process init stack.
 pub fn load_elf_to_vm(
     process_vm: &ProcessVm,
     file_header: &[u8],
-    elf_file: Arc<Dentry>,
+    elf_file: Dentry,
     fs_resolver: &FsResolver,
     argv: Vec<CString>,
     envp: Vec<CString>,
@@ -85,7 +84,7 @@ fn lookup_and_parse_ldso(
     elf: &Elf,
     file_header: &[u8],
     fs_resolver: &FsResolver,
-) -> Result<Option<(Arc<Dentry>, Elf)>> {
+) -> Result<Option<(Dentry, Elf)>> {
     let ldso_file = {
         let Some(ldso_path) = elf.ldso_path(file_header)? else {
             return Ok(None);
@@ -112,7 +111,7 @@ fn load_ldso(root_vmar: &Vmar<Full>, ldso_file: &Dentry, ldso_elf: &Elf) -> Resu
 
 fn init_and_map_vmos(
     process_vm: &ProcessVm,
-    ldso: Option<(Arc<Dentry>, Elf)>,
+    ldso: Option<(Dentry, Elf)>,
     parsed_elf: &Elf,
     elf_file: &Dentry,
 ) -> Result<(Vaddr, AuxVec)> {
@@ -301,7 +300,7 @@ fn map_segment_vmo(
             let head_frame = segment_vmo.commit_page(segment_offset)?;
             let new_frame = FrameAllocOptions::new()
                 .zeroed(false)
-                .alloc_single(())
+                .alloc_frame()
                 .unwrap();
             new_frame.writer().limit(page_offset).fill(0u8);
             new_frame
@@ -322,7 +321,7 @@ fn map_segment_vmo(
             let in_page_end = tail_padding_offset % PAGE_SIZE;
             let new_frame = FrameAllocOptions::new()
                 .zeroed(false)
-                .alloc_single(())
+                .alloc_frame()
                 .unwrap();
             new_frame.writer().skip(in_page_end).fill(0u8);
             new_frame
@@ -337,21 +336,19 @@ fn map_segment_vmo(
     }
 
     let perms = parse_segment_perm(program_header.flags);
-    let mut vm_map_options = root_vmar
-        .new_map(segment_size, perms)?
-        .vmo(segment_vmo)
-        .vmo_offset(segment_offset)
-        .vmo_limit(segment_offset + segment_size)
-        .can_overwrite(true);
     let offset = base_addr + (program_header.virtual_addr as Vaddr).align_down(PAGE_SIZE);
-    vm_map_options = vm_map_options.offset(offset).handle_page_faults_around();
-    let map_addr = vm_map_options.build()?;
+    if segment_size != 0 {
+        let mut vm_map_options = root_vmar
+            .new_map(segment_size, perms)?
+            .vmo(segment_vmo)
+            .vmo_offset(segment_offset)
+            .vmo_limit(segment_offset + segment_size)
+            .can_overwrite(true);
+        vm_map_options = vm_map_options.offset(offset).handle_page_faults_around();
+        vm_map_options.build()?;
+    }
 
-    let anonymous_map_size: usize = if total_map_size > segment_size {
-        total_map_size - segment_size
-    } else {
-        0
-    };
+    let anonymous_map_size: usize = total_map_size.saturating_sub(segment_size);
 
     if anonymous_map_size > 0 {
         let mut anonymous_map_options = root_vmar
@@ -383,11 +380,9 @@ fn check_segment_align(program_header: &ProgramHeader64) -> Result<()> {
         // no align requirement
         return Ok(());
     }
-    debug_assert!(align.is_power_of_two());
     if !align.is_power_of_two() {
         return_errno_with_message!(Errno::ENOEXEC, "segment align is invalid.");
     }
-    debug_assert!(program_header.offset % align == program_header.virtual_addr % align);
     if program_header.offset % align != program_header.virtual_addr % align {
         return_errno_with_message!(Errno::ENOEXEC, "segment align is not satisfied.");
     }

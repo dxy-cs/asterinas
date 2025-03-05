@@ -16,6 +16,9 @@ members = [
     "kernel/comps/framebuffer",
     "kernel/comps/input",
     "kernel/comps/network",
+    "kernel/comps/softirq",
+    "kernel/comps/logger",
+    "kernel/comps/mlsdisk",
     "kernel/comps/time",
     "kernel/comps/virtio",
     "kernel/libs/cpio-decoder",
@@ -25,6 +28,7 @@ members = [
     "kernel/libs/aster-rights-proc",
     "kernel/libs/aster-util",
     "kernel/libs/aster-bigtcp",
+    "kernel/libs/jhash",
     "kernel/libs/keyable-arc",
     "kernel/libs/typeflags",
     "kernel/libs/typeflags-util",
@@ -36,8 +40,10 @@ exclude = [
     "kernel/libs/comp-sys/component-macro",
     "kernel/libs/comp-sys/controlled",
     "osdk",
-    "target/osdk/base",
 ]
+
+[workspace.lints.clippy]
+allow_attributes = "warn"
 
 # Cargo only looks at the profile settings 
 # in the Cargo.toml manifest at the root of the workspace

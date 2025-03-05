@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(unused_variables)]
+#![expect(unused_variables)]
 
 use rand::{rngs::StdRng, Error as RandError, RngCore};
 use spin::Once;
@@ -36,6 +36,14 @@ pub fn init() {
                 let src = read_random().expect("read_random failed multiple times").to_ne_bytes();
                 tail.copy_from_slice(&src[..n]);
             }
+
+            RNG.call_once(|| SpinLock::new(StdRng::from_seed(seed)));
+        } else if #[cfg(target_arch = "riscv64")] {
+            use rand::SeedableRng;
+            use ostd::arch::boot::DEVICE_TREE;
+
+            let chosen = DEVICE_TREE.get().unwrap().find_node("/chosen").unwrap();
+            let seed = chosen.property("rng-seed").unwrap().value.try_into().unwrap();
 
             RNG.call_once(|| SpinLock::new(StdRng::from_seed(seed)));
         } else {

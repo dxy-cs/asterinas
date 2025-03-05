@@ -1,6 +1,6 @@
 # Running an OS in Intel TDX env
 
-OSDK supports running your OS in an [Intel TDX](https://www.intel.com/content/www/us/en/developer/tools/trust-domain-extensions/overview.html) environment conveniently.
+The OSDK supports running your OS in an [Intel TDX](https://www.intel.com/content/www/us/en/developer/tools/trust-domain-extensions/overview.html) environment conveniently.
 Intel TDX can provide a more secure environment for your OS.
 
 ## Prepare the Intel TDX Environment
@@ -32,14 +32,14 @@ Therefore, it is recommended to use a Docker image to deploy the environment.
 Run a TDX Docker container:
 
 ```bash
-docker run -it --privileged --network=host --device=/dev/kvm asterinas/osdk-tdx:0.4.2
+docker run -it --privileged --network=host --device=/dev/kvm asterinas/osdk:0.9.4-tdx
 ```
 
 ## Edit `OSDK.toml` for Intel TDX support
 
 As Intel TDX has extra requirements or restrictions for VMs,
 it demands adjusting the OSDK configurations accordingly.
-This can be easily achieved with the `scheme` feature of OSDK,
+This can be easily achieved with the `scheme` feature of the OSDK,
 which provides a convenient way to override the default OSDK configurations
 for a specific environment.
 

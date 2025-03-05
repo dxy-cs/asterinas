@@ -38,7 +38,7 @@ pub fn sys_madvise(
         | MadviseBehavior::MADV_WILLNEED => {
             // perform a read at first
             let mut buffer = vec![0u8; len];
-            ctx.get_user_space()
+            ctx.user_space()
                 .read_bytes(start, &mut VmWriter::from(buffer.as_mut_slice()))?;
         }
         MadviseBehavior::MADV_DONTNEED => {
@@ -53,14 +53,14 @@ pub fn sys_madvise(
 fn madv_free(start: Vaddr, end: Vaddr, ctx: &Context) -> Result<()> {
     let root_vmar = ctx.process.root_vmar();
     let advised_range = start..end;
-    let _ = root_vmar.destroy(advised_range);
+    let _ = root_vmar.remove_mapping(advised_range);
 
     Ok(())
 }
 
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, TryFromInt)]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 /// This definition is the same from linux
 pub enum MadviseBehavior {
     MADV_NORMAL = 0,     /* no further special treatment */

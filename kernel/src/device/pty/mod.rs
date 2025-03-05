@@ -10,13 +10,13 @@ use crate::{
     prelude::*,
 };
 
-#[allow(clippy::module_inception)]
+#[expect(clippy::module_inception)]
 mod pty;
 
 pub use pty::{PtyMaster, PtySlave};
 use spin::Once;
 
-static DEV_PTS: Once<Arc<Dentry>> = Once::new();
+static DEV_PTS: Once<Dentry> = Once::new();
 
 pub fn init() -> Result<()> {
     let fs = FsResolver::new();

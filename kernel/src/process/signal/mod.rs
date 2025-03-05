@@ -17,21 +17,22 @@ use core::{mem, sync::atomic::Ordering};
 
 use align_ext::AlignExt;
 use c_types::{siginfo_t, ucontext_t};
+use constants::SIGKILL;
 pub use events::{SigEvents, SigEventsFilter};
 use ostd::{cpu::UserContext, user::UserContextApi};
 pub use pause::{with_signal_blocked, Pause};
-pub use poll::{Pollable, Pollee, Poller};
+pub use poll::{PollAdaptor, PollHandle, Pollable, Pollee, Poller};
 use sig_action::{SigAction, SigActionFlags, SigDefaultAction};
 use sig_mask::SigMask;
 use sig_num::SigNum;
 pub use sig_stack::{SigStack, SigStackFlags};
 
-use super::posix_thread::PosixThread;
+use super::posix_thread::ThreadLocal;
 use crate::{
-    get_current_userspace,
+    cpu::LinuxAbi,
+    current_userspace,
     prelude::*,
-    process::{do_exit_group, TermStatus},
-    thread::status::ThreadStatus,
+    process::{posix_thread::do_exit_group, TermStatus},
 };
 
 pub trait SignalContext {
@@ -42,24 +43,40 @@ pub trait SignalContext {
 // TODO: This interface of this method is error prone.
 // The method takes an argument for the current thread to optimize its efficiency.
 /// Handle pending signal for current process.
-pub fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> Result<()> {
-    // We first deal with signal in current thread, then signal in current process.
+pub fn handle_pending_signal(
+    user_ctx: &mut UserContext,
+    ctx: &Context,
+    syscall_number: Option<usize>,
+) {
+    let syscall_restart = if let Some(syscall_number) = syscall_number
+        && user_ctx.syscall_ret() == -(Errno::ERESTARTSYS as i32) as usize
+    {
+        // We should never return `ERESTARTSYS` to the userspace.
+        user_ctx.set_syscall_ret(-(Errno::EINTR as i32) as usize);
+        Some(syscall_number)
+    } else {
+        None
+    };
+
     let posix_thread = ctx.posix_thread;
+    let current = ctx.process;
+
     let signal = {
         let sig_mask = posix_thread.sig_mask().load(Ordering::Relaxed);
         if let Some(signal) = posix_thread.dequeue_signal(&sig_mask) {
             signal
         } else {
-            return Ok(());
+            return;
         }
     };
-
     let sig_num = signal.num();
     trace!("sig_num = {:?}, sig_name = {}", sig_num, sig_num.sig_name());
-    let current = posix_thread.process();
+
     let mut sig_dispositions = current.sig_dispositions().lock();
+
     let sig_action = sig_dispositions.get(sig_num);
     trace!("sig action: {:x?}", sig_action);
+
     match sig_action {
         SigAction::Ign => {
             trace!("Ignore signal {:?}", sig_num);
@@ -70,6 +87,19 @@ pub fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> Resul
             restorer_addr,
             mask,
         } => {
+            if let Some(syscall_number) = syscall_restart
+                && flags.contains(SigActionFlags::SA_RESTART)
+            {
+                #[cfg(target_arch = "x86_64")]
+                const SYSCALL_INSTR_LEN: usize = 2; // syscall
+                #[cfg(target_arch = "riscv64")]
+                const SYSCALL_INSTR_LEN: usize = 4; // ecall
+
+                user_ctx.set_syscall_num(syscall_number);
+                user_ctx
+                    .set_instruction_pointer(user_ctx.instruction_pointer() - SYSCALL_INSTR_LEN);
+            }
+
             if flags.contains(SigActionFlags::SA_RESETHAND) {
                 // In Linux, SA_RESETHAND corresponds to SA_ONESHOT,
                 // which means the user handler will be executed only once and then reset to the default.
@@ -78,8 +108,7 @@ pub fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> Resul
             }
 
             drop(sig_dispositions);
-
-            handle_user_signal(
+            if let Err(e) = handle_user_signal(
                 ctx,
                 sig_num,
                 handler_addr,
@@ -88,7 +117,10 @@ pub fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> Resul
                 mask,
                 user_ctx,
                 signal.to_info(),
-            )?
+            ) {
+                debug!("Failed to handle user signal: {:?}", e);
+                do_exit_group(TermStatus::Killed(SIGKILL));
+            }
         }
         SigAction::Dfl => {
             drop(sig_dispositions);
@@ -107,28 +139,17 @@ pub fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) -> Resul
                 }
                 SigDefaultAction::Ign => {}
                 SigDefaultAction::Stop => {
-                    let _ = ctx.thread.atomic_status().compare_exchange(
-                        ThreadStatus::Running,
-                        ThreadStatus::Stopped,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
+                    let _ = ctx.thread.stop();
                 }
                 SigDefaultAction::Cont => {
-                    let _ = ctx.thread.atomic_status().compare_exchange(
-                        ThreadStatus::Stopped,
-                        ThreadStatus::Running,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
+                    let _ = ctx.thread.resume();
                 }
             }
         }
     }
-    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn handle_user_signal(
     ctx: &Context,
     sig_num: SigNum,
@@ -160,7 +181,7 @@ pub fn handle_user_signal(
         .store(old_mask + mask, Ordering::Relaxed);
 
     // Set up signal stack.
-    let mut stack_pointer = if let Some(sp) = use_alternate_signal_stack(ctx.posix_thread) {
+    let mut stack_pointer = if let Some(sp) = use_alternate_signal_stack(ctx.thread_local) {
         sp as u64
     } else {
         // just use user stack
@@ -170,7 +191,7 @@ pub fn handle_user_signal(
     // To avoid corrupting signal stack, we minus 128 first.
     stack_pointer -= 128;
 
-    let user_space = ctx.get_user_space();
+    let user_space = ctx.user_space();
 
     // 1. write siginfo_t
     stack_pointer -= mem::size_of::<siginfo_t>() as u64;
@@ -188,8 +209,8 @@ pub fn handle_user_signal(
         .inner
         .gp_regs
         .copy_from_raw(user_ctx.general_regs());
-    let mut sig_context = ctx.posix_thread.sig_context().lock();
-    if let Some(sig_context_addr) = *sig_context {
+    let sig_context = ctx.thread_local.sig_context().get();
+    if let Some(sig_context_addr) = sig_context {
         ucontext.uc_link = sig_context_addr;
     } else {
         ucontext.uc_link = 0;
@@ -198,7 +219,9 @@ pub fn handle_user_signal(
     user_space.write_val(stack_pointer as _, &ucontext)?;
     let ucontext_addr = stack_pointer;
     // Store the ucontext addr in sig context of current thread.
-    *sig_context = Some(ucontext_addr as Vaddr);
+    ctx.thread_local
+        .sig_context()
+        .set(Some(ucontext_addr as Vaddr));
 
     // 3. Set the address of the trampoline code.
     if flags.contains(SigActionFlags::SA_RESTORER) {
@@ -229,6 +252,15 @@ pub fn handle_user_signal(
     } else {
         user_ctx.set_arguments(sig_num, 0, 0);
     }
+    // CPU architecture-dependent logic
+    cfg_if::cfg_if! {
+        if #[cfg(target_arch = "x86_64")] {
+            // Clear `DF` flag for C function entry to conform to x86-64 calling convention.
+            // Bit 10 is the DF flag.
+            const X86_RFLAGS_DF: usize = 1 << 10;
+            user_ctx.general_regs_mut().rflags &= !X86_RFLAGS_DF;
+        }
+    }
 
     Ok(())
 }
@@ -237,8 +269,8 @@ pub fn handle_user_signal(
 /// It the stack is already active, we just increase the handler counter and return None, since
 /// the stack pointer can be read from context.
 /// It the stack is not used by any handler, we will return the new sp in alternate signal stack.
-fn use_alternate_signal_stack(posix_thread: &PosixThread) -> Option<usize> {
-    let mut sig_stack = posix_thread.sig_stack().lock();
+fn use_alternate_signal_stack(thread_local: &ThreadLocal) -> Option<usize> {
+    let mut sig_stack = thread_local.sig_stack().borrow_mut();
     let sig_stack = (*sig_stack).as_mut()?;
 
     if sig_stack.is_disabled() {
@@ -260,7 +292,7 @@ fn use_alternate_signal_stack(posix_thread: &PosixThread) -> Option<usize> {
 
 fn write_u64_to_user_stack(rsp: u64, value: u64) -> Result<u64> {
     let rsp = rsp - 8;
-    get_current_userspace!().write_val(rsp as Vaddr, &value)?;
+    current_userspace!().write_val(rsp as Vaddr, &value)?;
     Ok(rsp)
 }
 

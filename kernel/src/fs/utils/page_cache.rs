@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use core::{
     iter,
@@ -13,7 +13,10 @@ use aster_block::bio::{BioStatus, BioWaiter};
 use aster_rights::Full;
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use lru::LruCache;
-use ostd::mm::{stat::{self, mem_available}, AnyFrame, Frame, FrameAllocOptions, HasPaddr, UntypedPage, VmIo};
+use ostd::{
+    impl_untyped_frame_meta_for,
+    mm::{stat::{self, mem_available}, UFrame, Frame, FrameAllocOptions, HasPaddr, VmIo},
+};
 
 use crate::{
     prelude::*,
@@ -62,19 +65,19 @@ impl LRULists {
 
     // Reclaim one page in the tail part of the inactive list
     fn reclaim(&mut self) {
-        /// 1. Trigger reclaim_one();
-        /// 2. Find a suitable page to reclaim(is_mapped == false)
-        /// 3. Look for the dirty info(page.PageState)
-        /// page -> vmo -> pager(pagecachemanager) -> evict(dirty)
-        /// page -> vmo -> pager(pagecachemanager) -> discard(dirty)
-        /// 4. Remove page in LruLists
-        /// 5. size -= page.size()
-        /// 6. [in]active_size -= page.size()
+        // 1. Trigger reclaim_one();
+        // 2. Find a suitable page to reclaim(is_mapped == false)
+        // 3. Look for the dirty info(page.PageState)
+        // page -> vmo -> pager(pagecachemanager) -> evict(dirty)
+        // page -> vmo -> pager(pagecachemanager) -> discard(dirty)
+        // 4. Remove page in LruLists
+        // 5. size -= page.size()
+        // 6. [in]active_size -= page.size()
 
         
         let mut reclaimed = false;
         let mut cursor = self.inactive_list.back_mut();
-        /// Traverse the inactive_list from the end until finding a page with metadata.is_mmapped == false
+        // Traverse the inactive_list from the end until finding a page with metadata.is_mmapped == false
         while let Some(node) = cursor.get() {
             if !node.page.metadata().is_mmapped.load(Ordering::Relaxed) {
                 let size = node.page.size();
@@ -85,11 +88,11 @@ impl LRULists {
                     if node.page.metadata().state.load(Ordering::Relaxed) == PageState::Dirty {
                         let _ = pager
                                 .unwrap()
-                                .evict_range(node.page.paddr()..node.page.paddr() + PAGE_SIZE);
+                                .evict_range(node.page.start_paddr()..node.page.start_paddr() + PAGE_SIZE);
                     } else {
                         let _ = pager
                                 .unwrap()
-                                .discard_range(node.page.paddr()..node.page.paddr() + PAGE_SIZE);
+                                .discard_range(node.page.start_paddr()..node.page.start_paddr() + PAGE_SIZE);
                     }
                     self.size -= size;
                     self.inactive_size -= size;
@@ -101,7 +104,7 @@ impl LRULists {
             cursor.move_prev();
         }
         
-        /// If no suitable page is found in inactive_list, find one in active_list to delete.
+        // If no suitable page is found in inactive_list, find one in active_list to delete.
         if !reclaimed {
             let mut cursor = self.active_list.back_mut();
             while let Some(node) = cursor.get() {
@@ -113,11 +116,11 @@ impl LRULists {
                         if node.page.metadata().state.load(Ordering::Relaxed) == PageState::Dirty {
                             let _ = pager
                                     .unwrap()
-                                    .evict_range(node.page.paddr()..node.page.paddr() + PAGE_SIZE);
+                                    .evict_range(node.page.start_paddr()..node.page.start_paddr() + PAGE_SIZE);
                         } else {
                             let _ = pager
                                     .unwrap()
-                                    .discard_range(node.page.paddr()..node.page.paddr() + PAGE_SIZE);
+                                    .discard_range(node.page.start_paddr()..node.page.start_paddr() + PAGE_SIZE);
                         }
                         self.size -= size;
                         self.active_size -= size;
@@ -169,8 +172,8 @@ impl LRULists {
         // to the head of the active_list
         let mut cursor = self.inactive_list.front_mut();
         while let Some(node) = cursor.get() {
-            if node.page.paddr() == page.paddr() {
-                //println!("{}", page.paddr());
+            if node.page.start_paddr() == page.start_paddr() {
+                //println!("{}", page.start_paddr());
                 cursor.remove();
                 break;
             }
@@ -196,7 +199,7 @@ impl LRULists {
         // to the head of the active_list
         let mut cursor = self.active_list.front_mut();
         while let Some(node) = cursor.get() {
-            if node.page.paddr() == page.paddr() {
+            if node.page.start_paddr() == page.start_paddr() {
                 cursor.remove();
                 break;
             }
@@ -211,7 +214,7 @@ impl LRULists {
 
     fn in_active(&self, page: CachePage) -> bool {
         for node in self.active_list.iter() {
-            if node.page.paddr() == page.paddr() {
+            if node.page.start_paddr() == page.start_paddr() {
                 return true;
             }
         }
@@ -220,7 +223,7 @@ impl LRULists {
 
     fn in_inactive(&self, page: CachePage) -> bool {
         for node in self.inactive_list.iter() {
-            if node.page.paddr() == page.paddr() {
+            if node.page.start_paddr() == page.start_paddr() {
                 return true;
             }
         }
@@ -228,8 +231,15 @@ impl LRULists {
     }
 }
 
-lazy_static! {
-    pub static ref LRU_LISTS: Mutex<LRULists> = Mutex::new(LRULists::new(mem_available(), 90, 70));
+static LRU_LISTS: spin::Once<Mutex<LRULists>> = spin::Once::new();
+
+pub fn get_lru_lists() -> &'static Mutex<LRULists> {
+    if !LRU_LISTS.is_completed() {
+        LRU_LISTS.call_once(|| {
+            Mutex::new(LRULists::new(mem_available(), 90, 70))
+        });
+    }
+    LRU_LISTS.get().unwrap()
 }
 
 pub struct PageCache {
@@ -521,8 +531,8 @@ impl ReadaheadState {
             return_errno!(Errno::EINVAL)
         };
         for async_idx in window.readahead_range() {
-            let mut async_page = CachePage::alloc()?;
-            let pg_waiter = backend.read_page_async(async_idx, (&async_page).into())?;
+            let mut async_page = CachePage::alloc_uninit()?;
+            let pg_waiter = backend.read_page_async(async_idx, &async_page)?;
             if pg_waiter.nreqs() > 0 {
                 self.waiter.concat(pg_waiter);
             } else {
@@ -578,7 +588,7 @@ impl PageCacheManager {
         for idx in page_idx_range.start..page_idx_range.end {
             if let Some(page) = pages.peek(&idx) {
                 if page.load_state() == PageState::Dirty && idx < backend_npages {
-                    let waiter = backend.write_page_async(idx, page.into())?;
+                    let waiter = backend.write_page_async(idx, page)?;
                     bio_waiter.concat(waiter);
                 }
             }
@@ -598,7 +608,7 @@ impl PageCacheManager {
         Ok(())
     }
 
-    fn ondemand_readahead(&self, idx: usize) -> Result<CachePage> {
+    fn ondemand_readahead(&self, idx: usize) -> Result<UFrame> {
         let mut pages = self.pages.lock();
         let mut ra_state = self.ra_state.lock();
         let backend = self.backend();
@@ -626,17 +636,17 @@ impl PageCacheManager {
             // Cond 3.
             // Conducts the sync read operation.
             let page = if idx < backend.npages() {
-                let mut page = CachePage::alloc()?;
-                backend.read_page(idx, (&page).into())?;
+                let mut page = CachePage::alloc_uninit()?;
+                backend.read_page(idx, &page)?;
                 page.store_state(PageState::UpToDate);
                 page
             } else {
-                CachePage::alloc_zero()?
+                CachePage::alloc_zero(PageState::Uninit)?
             };
             let frame = page.clone();
             pages.put(idx, page);
-            // Load page to LRULists.@dxy
-            LRU_LISTS.lock().load_page(frame.clone());
+            // Load page to LRULists.
+            get_lru_lists().lock().load_page(frame.clone());
             frame
         };
         if ra_state.should_readahead(idx, backend.npages()) {
@@ -644,7 +654,7 @@ impl PageCacheManager {
             ra_state.conduct_readahead(&mut pages, backend)?;
         }
         ra_state.set_prev_page(idx);
-        Ok(frame)
+        Ok(frame.into())
     }
 }
 
@@ -657,7 +667,7 @@ impl Debug for PageCacheManager {
 }
 
 impl PageCacheManager {
-    pub fn commit_page(&self, idx: usize) -> Result<CachePage> {
+    pub fn commit_page(&self, idx: usize) -> Result<UFrame> {
         self.ondemand_readahead(idx)
     }
 
@@ -683,10 +693,10 @@ impl PageCacheManager {
             let page_ = page.clone();
             let page__ = page.clone();
             let page___ = page.clone();
-            if LRU_LISTS.lock().in_active(page_) {
-                LRU_LISTS.lock().promotion_from_active(page__);
-            } else if LRU_LISTS.lock().in_inactive(page___) {
-                LRU_LISTS.lock().promotion_from_inactive(page__);
+            if get_lru_lists().lock().in_active(page_) {
+                get_lru_lists().lock().promotion_from_active(page__);
+            } else if get_lru_lists().lock().in_inactive(page___) {
+                get_lru_lists().lock().promotion_from_inactive(page__);
             } else {
             }
         } else {
@@ -704,7 +714,7 @@ impl PageCacheManager {
                     return Ok(());
                 };
                 if idx < backend.npages() {
-                    backend.write_page(idx, &page.into())?;
+                    backend.write_page(idx, &page)?;
                 }
             }
         }
@@ -712,16 +722,16 @@ impl PageCacheManager {
         Ok(())
     }
 
-    pub fn commit_overwrite(&self, idx: usize) -> Result<CachePage> {
+    pub fn commit_overwrite(&self, idx: usize) -> Result<UFrame> {
         if let Some(page) = self.pages.lock().get(&idx) {
-            return Ok(page.clone());
+            return Ok(page.clone().into());
         }
 
-        let page = CachePage::alloc_zero()?;
+        let page = CachePage::alloc_uninit()?;
         let page_tmp = self.pages.lock().get_or_insert(idx, || page).clone();
         // Load page to LRULists.@dxy
-        LRU_LISTS.lock().load_page(page_tmp.clone());
-        Ok(page_tmp)
+        get_lru_lists().lock().load_page(page_tmp.clone());
+        Ok(page_tmp.into())
     }
 }
 
@@ -729,38 +739,52 @@ impl PageCacheManager {
 pub type CachePage = Frame<CachePageMeta>;
 
 /// Metadata for a page in the page cache.
+#[derive(Debug)]
 pub struct CachePageMeta {
     pub state: AtomicPageState,
     pub reverse_map: RwLock<Option<Arc<Vmo_>>>,
     pub is_mmapped: AtomicBool,
 }
 
+impl_untyped_frame_meta_for!(CachePageMeta);
+
 pub trait CachePageExt {
+    /// Gets the metadata associated with the cache page.
     fn metadata(&self) -> &CachePageMeta;
 
-    fn alloc() -> Result<CachePage> {
+    /// Allocates a new cache page which content and state are uninitialized.
+    fn alloc_uninit() -> Result<CachePage> {
         let meta = CachePageMeta {
-            state: AtomicPageState {
-                state: AtomicU8::new(PageState::Uninit as u8),
-            },
+            state: AtomicPageState::new(PageState::Uninit),
             reverse_map: RwLock::new(None),
             is_mmapped: AtomicBool::new(false),
         };
-        let page = FrameAllocOptions::new().zeroed(false).alloc_single(meta)?;
-        //LRU_LISTS.lock().load_page(page.clone());
+        let page = FrameAllocOptions::new()
+            .zeroed(false)
+            .alloc_frame_with(meta)?;
+        //get_lru_lists().lock().load_page(page.clone());
         Ok(page)
     }
 
-    fn alloc_zero() -> Result<CachePage> {
-        let page = Self::alloc()?;
-        page.writer().fill(0);
+    /// Allocates a new zeroed cache page with the wanted state.
+    fn alloc_zero(state: PageState) -> Result<CachePage> {
+        let meta = CachePageMeta {
+            state: AtomicPageState::new(state),
+            reverse_map: RwLock::new(None),
+            is_mmapped: AtomicBool::new(false),
+        };
+        let page = FrameAllocOptions::new()
+            .zeroed(true)
+            .alloc_frame_with(meta)?;
         Ok(page)
     }
 
+    /// Loads the current state of the cache page.
     fn load_state(&self) -> PageState {
         self.metadata().state.load(Ordering::Relaxed)
     }
 
+    /// Stores a new state for the cache page.
     fn store_state(&mut self, new_state: PageState) {
         self.metadata().state.store(new_state, Ordering::Relaxed);
     }
@@ -768,7 +792,7 @@ pub trait CachePageExt {
 
 impl CachePageExt for CachePage {
     fn metadata(&self) -> &CachePageMeta {
-        self.metadata()
+        self.meta()
     }
 }
 
@@ -787,11 +811,18 @@ pub enum PageState {
 }
 
 /// A page state with atomic operations.
+#[derive(Debug)]
 pub struct AtomicPageState {
     state: AtomicU8,
 }
 
 impl AtomicPageState {
+    pub fn new(state: PageState) -> Self {
+        Self {
+            state: AtomicU8::new(state as _),
+        }
+    }
+
     pub fn load(&self, order: Ordering) -> PageState {
         let val = self.state.load(order);
         match val {
@@ -810,16 +841,16 @@ impl AtomicPageState {
 /// This trait represents the backend for the page cache.
 pub trait PageCacheBackend: Sync + Send {
     /// Reads a page from the backend asynchronously.
-    fn read_page_async(&self, idx: usize, frame: &AnyFrame) -> Result<BioWaiter>;
+    fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter>;
     /// Writes a page to the backend asynchronously.
-    fn write_page_async(&self, idx: usize, frame: &AnyFrame) -> Result<BioWaiter>;
+    fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter>;
     /// Returns the number of pages in the backend.
     fn npages(&self) -> usize;
 }
 
 impl dyn PageCacheBackend {
     /// Reads a page from the backend synchronously.
-    fn read_page(&self, idx: usize, frame: &AnyFrame) -> Result<()> {
+    fn read_page(&self, idx: usize, frame: &CachePage) -> Result<()> {
         let waiter = self.read_page_async(idx, frame)?;
         match waiter.wait() {
             Some(BioStatus::Complete) => Ok(()),
@@ -827,7 +858,7 @@ impl dyn PageCacheBackend {
         }
     }
     /// Writes a page to the backend synchronously.
-    fn write_page(&self, idx: usize, frame: &AnyFrame) -> Result<()> {
+    fn write_page(&self, idx: usize, frame: &CachePage) -> Result<()> {
         let waiter = self.write_page_async(idx, frame)?;
         match waiter.wait() {
             Some(BioStatus::Complete) => Ok(()),

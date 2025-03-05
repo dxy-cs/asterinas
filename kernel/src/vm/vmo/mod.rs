@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-#![allow(unused_variables)]
+#![expect(dead_code)]
+#![expect(unused_variables)]
 
 //! Virtual Memory Objects (VMOs).
 
-use core::ops::Range;
+use core::{any::Any, ops::Range};
 
 use align_ext::AlignExt;
 use aster_rights::Rights;
 use ostd::{
     collections::xarray::{CursorMut, XArray},
-    mm::{AnyFrame, FrameAllocOptions, HasPaddr, UntypedPage, VmReader, VmWriter},
+    mm::{FrameAllocOptions, UFrame, UntypedMem, VmReader, VmWriter},
 };
 
 use crate::{
-    fs::utils::{CachePage, PageCacheManager, LruListNode, LRULists, LRU_LISTS},
+    fs::utils::{CachePage, CachePageMeta, PageCacheManager},
     prelude::*,
 };
 
@@ -69,8 +69,8 @@ pub use options::VmoOptions;
 /// # Implementation
 ///
 /// `Vmo` provides high-level APIs for address space management by wrapping
-/// around its low-level counterpart [`ostd::mm::AnyFrame`].
-/// Compared with `AnyFrame`,
+/// around its low-level counterpart [`ostd::mm::UFrame`].
+/// Compared with `UFrame`,
 /// `Vmo` is easier to use (by offering more powerful APIs) and
 /// harder to misuse (thanks to its nature of being capability).
 #[derive(Debug)]
@@ -128,12 +128,12 @@ bitflags! {
     }
 }
 
-/// `Pages` is the struct that manages the `AnyFrame`s stored in `Vmo_`.
+/// `Pages` is the struct that manages the `UFrame`s stored in `Vmo_`.
 pub(super) enum Pages {
     /// `Pages` that cannot be resized. This kind of `Pages` will have a constant size.
-    Nonresizable(Mutex<XArray<AnyFrame>>, usize),
+    Nonresizable(Mutex<XArray<UFrame>>, usize),
     /// `Pages` that can be resized and have a variable size.
-    Resizable(Mutex<(XArray<AnyFrame>, usize)>),
+    Resizable(Mutex<(XArray<UFrame>, usize)>),
 }
 
 impl Clone for Pages {
@@ -152,7 +152,7 @@ impl Clone for Pages {
 impl Pages {
     fn with<R, F>(&self, func: F) -> R
     where
-        F: FnOnce(&mut XArray<AnyFrame>, usize) -> R,
+        F: FnOnce(&mut XArray<UFrame>, usize) -> R,
     {
         match self {
             Self::Nonresizable(pages, size) => func(&mut pages.lock(), *size),
@@ -207,14 +207,16 @@ impl CommitFlags {
 
 impl Vmo_ {
     /// Prepares a new `AnyFrame` for the target index in pages, returns this new frame.
-    fn prepare_page(self: &Arc<Self>, page_idx: usize) -> Result<AnyFrame> {
+    fn prepare_page(self: &Arc<Self>, page_idx: usize) -> Result<UFrame> {
         match &self.pager {
-            None => Ok(FrameAllocOptions::new().alloc_single(())?.into()),
+            None => Ok(FrameAllocOptions::new().alloc_frame()?.into()),
             Some(pager) => {
                 let page_tmp = pager.commit_page(page_idx)?;
-                {
-                    let mut reverse_map = page_tmp.metadata().reverse_map.write();
-                    *reverse_map = Some(self.clone());
+                match (page_tmp.dyn_meta() as &dyn Any).downcast_ref::<CachePageMeta>() {
+                    Some(meta) => {
+                        *meta.reverse_map.write() = Some(self.clone());
+                    }
+                    None => {}
                 }
                 Ok(page_tmp.into())
             }
@@ -222,24 +224,26 @@ impl Vmo_ {
     }
 
     /// Prepares a new `AnyFrame` for the target index in the VMO, returns this new frame.
-    fn prepare_overwrite(self: &Arc<Self>, page_idx: usize) -> Result<AnyFrame> {
+    fn prepare_overwrite(self: &Arc<Self>, page_idx: usize) -> Result<UFrame> {
         if let Some(pager) = &self.pager {
             let page_tmp = pager.commit_overwrite(page_idx)?;
-            {
-                let mut reverse_map = page_tmp.metadata().reverse_map.write();
-                *reverse_map = Some(self.clone());
+            match (page_tmp.dyn_meta() as &dyn Any).downcast_ref::<CachePageMeta>() {
+                Some(meta) => {
+                    *meta.reverse_map.write() = Some(self.clone());
+                }
+                None => {}
             }
             Ok(page_tmp.into())
         } else {
-            Ok(FrameAllocOptions::new().alloc_single(())?.into())
+            Ok(FrameAllocOptions::new().alloc_frame()?.into())
         }
     }
 
     fn commit_with_cursor(
         self: &Arc<Self>,
-        cursor: &mut CursorMut<'_, AnyFrame>,
+        cursor: &mut CursorMut<'_, UFrame>,
         commit_flags: CommitFlags,
-    ) -> Result<AnyFrame> {
+    ) -> Result<UFrame> {
         let new_page = {
             if let Some(committed_page) = cursor.load() {
                 // Fast path: return the page directly.
@@ -258,7 +262,7 @@ impl Vmo_ {
 
     /// Commits the page corresponding to the target offset in the VMO and return that page.
     /// If the current offset has already been committed, the page will be returned directly.
-    pub fn commit_page(self: &Arc<Self>, offset: usize) -> Result<AnyFrame> {
+    pub fn commit_page(self: &Arc<Self>, offset: usize) -> Result<UFrame> {
         let page_idx = offset / PAGE_SIZE;
         self.pages.with(|pages, size| {
             if offset >= size {
@@ -296,7 +300,7 @@ impl Vmo_ {
         commit_flags: CommitFlags,
     ) -> Result<()>
     where
-        F: FnMut(&mut dyn FnMut() -> Result<AnyFrame>) -> Result<()>,
+        F: FnMut(&mut dyn FnMut() -> Result<UFrame>) -> Result<()>,
     {
         self.pages.with(|pages, size| {
             if range.end > size {
@@ -332,7 +336,7 @@ impl Vmo_ {
         let read_range = offset..(offset + read_len);
         let mut read_offset = offset % PAGE_SIZE;
 
-        let read = move |commit_fn: &mut dyn FnMut() -> Result<AnyFrame>| {
+        let read = move |commit_fn: &mut dyn FnMut() -> Result<UFrame>| {
             let frame = commit_fn()?;
             frame.reader().skip(read_offset).read_fallible(writer)?;
             read_offset = 0;
@@ -356,7 +360,7 @@ impl Vmo_ {
         let write_range = offset..(offset + write_len);
         let mut write_offset = offset % PAGE_SIZE;
 
-        let mut write = move |commit_fn: &mut dyn FnMut() -> Result<AnyFrame>| {
+        let mut write = move |commit_fn: &mut dyn FnMut() -> Result<UFrame>| {
             let frame = commit_fn()?;
             frame.writer().skip(write_offset).write_fallible(reader)?;
             write_offset = 0;
@@ -427,7 +431,7 @@ impl Vmo_ {
         Ok(())
     }
 
-    fn decommit_pages(&self, pages: &mut XArray<AnyFrame>, range: Range<usize>) -> Result<()> {
+    fn decommit_pages(&self, pages: &mut XArray<UFrame>, range: Range<usize>) -> Result<()> {
         let page_idx_range = get_page_idx_range(&range);
         let mut cursor = pages.cursor_mut(page_idx_range.start as u64);
         for page_idx in page_idx_range {
@@ -457,7 +461,7 @@ impl Vmo_ {
         self.pager.clone()
     }
 
-    fn replace(&self, page: AnyFrame, page_idx: usize) -> Result<()> {
+    fn replace(&self, page: UFrame, page_idx: usize) -> Result<()> {
         self.pages.with(|pages, size| {
             if page_idx >= size / PAGE_SIZE {
                 return_errno_with_message!(Errno::EINVAL, "the page index is outside of the vmo");

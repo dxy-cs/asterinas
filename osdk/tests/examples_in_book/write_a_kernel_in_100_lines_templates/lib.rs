@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #![no_std]
-// The feature `linkage` is required for `ostd::main` to work.
-#![feature(linkage)]
+#![deny(unsafe_code)]
 
 extern crate alloc;
 
@@ -38,10 +37,10 @@ fn create_user_space(program: &[u8]) -> UserSpace {
     let nbytes = program.len().align_up(PAGE_SIZE);
     let user_pages = {
         let segment = FrameAllocOptions::new()
-            .alloc_contiguous(nbytes / PAGE_SIZE, |_| ())
+            .alloc_segment(nbytes / PAGE_SIZE)
             .unwrap();
         // Physical memory pages can be only accessed
-        // via the `Frame` or `Segment` abstraction.
+        // via the `UFrame` or `USegment` abstraction.
         segment.write_bytes(0, program).unwrap();
         segment
     };
@@ -55,7 +54,7 @@ fn create_user_space(program: &[u8]) -> UserSpace {
         let mut cursor = vm_space.cursor_mut(&(MAP_ADDR..MAP_ADDR + nbytes)).unwrap();
         let map_prop = PageProperty::new(PageFlags::RWX, CachePolicy::Writeback);
         for frame in user_pages {
-            cursor.map(frame, map_prop);
+            cursor.map(frame.into(), map_prop);
         }
         drop(cursor);
         Arc::new(vm_space)

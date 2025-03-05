@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-#![allow(unused_variables)]
+#![expect(dead_code)]
+#![expect(unused_variables)]
 
 use alloc::string::String;
 use core::{cmp::Ordering, time::Duration};
 
 pub(super) use align_ext::AlignExt;
 use aster_block::{
-    bio::BioWaiter,
+    bio::{BioDirection, BioSegment, BioWaiter},
     id::{Bid, BlockId},
     BLOCK_SIZE,
 };
 use aster_rights::Full;
-use ostd::mm::{AnyFrame, FrameAllocOptions, VmIo};
+use ostd::mm::{Segment, VmIo};
 
 use super::{
     constants::*,
@@ -29,13 +29,14 @@ use crate::{
     events::IoEvents,
     fs::{
         exfat::{dentry::ExfatDentryIterator, fat::ExfatChain, fs::ExfatFS},
+        path::{is_dot, is_dot_or_dotdot, is_dotdot},
         utils::{
-            DirentVisitor, Extension, Inode, InodeMode, InodeType, IoctlCmd, Metadata, MknodType,
-            PageCache, PageCacheBackend,
+            CachePage, DirentVisitor, Extension, Inode, InodeMode, InodeType, IoctlCmd, Metadata,
+            MknodType, PageCache, PageCacheBackend,
         },
     },
     prelude::*,
-    process::{signal::Poller, Gid, Uid},
+    process::{signal::PollHandle, Gid, Uid},
     vm::vmo::Vmo,
 };
 
@@ -135,20 +136,24 @@ struct ExfatInodeInner {
 }
 
 impl PageCacheBackend for ExfatInode {
-    fn read_page_async(&self, idx: usize, frame: &AnyFrame) -> Result<BioWaiter> {
+    fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         let inner = self.inner.read();
         if inner.size < idx * PAGE_SIZE {
             return_errno_with_message!(Errno::EINVAL, "Invalid read size")
         }
         let sector_id = inner.get_sector_id(idx * PAGE_SIZE / inner.fs().sector_size())?;
-        let waiter = inner.fs().block_device().read_block_async(
+        let bio_segment = BioSegment::new_from_segment(
+            Segment::from(frame.clone()).into(),
+            BioDirection::FromDevice,
+        );
+        let waiter = inner.fs().block_device().read_blocks_async(
             BlockId::from_offset(sector_id * inner.fs().sector_size()),
-            frame,
+            bio_segment,
         )?;
         Ok(waiter)
     }
 
-    fn write_page_async(&self, idx: usize, frame: &AnyFrame) -> Result<BioWaiter> {
+    fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         let inner = self.inner.read();
         let sector_size = inner.fs().sector_size();
 
@@ -156,9 +161,13 @@ impl PageCacheBackend for ExfatInode {
 
         // FIXME: We may need to truncate the file if write_page fails.
         // To fix this issue, we need to change the interface of the PageCacheBackend trait.
-        let waiter = inner.fs().block_device().write_block_async(
+        let bio_segment = BioSegment::new_from_segment(
+            Segment::from(frame.clone()).into(),
+            BioDirection::ToDevice,
+        );
+        let waiter = inner.fs().block_device().write_blocks_async(
             BlockId::from_offset(sector_id * inner.fs().sector_size()),
-            frame,
+            bio_segment,
         )?;
         Ok(waiter)
     }
@@ -482,7 +491,7 @@ impl ExfatInodeInner {
         };
 
         // FIXME: This isn't expected by the compiler.
-        #[allow(non_local_definitions)]
+        #[expect(non_local_definitions)]
         impl DirentVisitor for Vec<(String, usize)> {
             fn visit(
                 &mut self,
@@ -891,7 +900,7 @@ impl ExfatInode {
         // TODO: remove trailing periods of pathname.
         // Do not allow creation of files with names ending with period(s).
 
-        let name_dentries = (name.len() + EXFAT_FILE_NAME_LEN - 1) / EXFAT_FILE_NAME_LEN;
+        let name_dentries = name.len().div_ceil(EXFAT_FILE_NAME_LEN);
         let num_dentries = name_dentries + 2; // FILE Entry + Stream Entry + Name Entry
 
         // We update the size of inode before writing page_cache, but it is fine since we've cleaned the page_cache.
@@ -1002,7 +1011,7 @@ impl ExfatInode {
         let sub_dir = inner.num_sub_inodes;
         let mut child_offsets: Vec<usize> = vec![];
         // FIXME: This isn't expected by the compiler.
-        #[allow(non_local_definitions)]
+        #[expect(non_local_definitions)]
         impl DirentVisitor for Vec<usize> {
             fn visit(
                 &mut self,
@@ -1139,7 +1148,7 @@ impl Inode for ExfatInode {
             ino: inner.ino,
             size: inner.size,
             blk_size,
-            blocks: (inner.size + blk_size - 1) / blk_size,
+            blocks: inner.size.div_ceil(blk_size),
             atime: inner.atime.as_duration().unwrap_or_default(),
             mtime: inner.mtime.as_duration().unwrap_or_default(),
             ctime: inner.ctime.as_duration().unwrap_or_default(),
@@ -1263,10 +1272,7 @@ impl Inode for ExfatInode {
             .discard_range(read_off..read_off + read_len);
 
         let mut buf_offset = 0;
-        let frame = FrameAllocOptions::new()
-            .zeroed(false)
-            .alloc_single(())
-            .unwrap();
+        let bio_segment = BioSegment::alloc(1, BioDirection::FromDevice);
 
         let start_pos = inner.start_chain.walk_to_cluster_at_offset(read_off)?;
         let cluster_size = inner.fs().cluster_size();
@@ -1278,8 +1284,8 @@ impl Inode for ExfatInode {
             inner
                 .fs()
                 .block_device()
-                .read_block(physical_bid, (&frame).into())?;
-            frame.read(0, writer).unwrap();
+                .read_blocks(physical_bid, bio_segment.clone())?;
+            bio_segment.reader().unwrap().read_fallible(writer)?;
             buf_offset += BLOCK_SIZE;
 
             cur_offset += BLOCK_SIZE;
@@ -1373,24 +1379,18 @@ impl Inode for ExfatInode {
 
         let inner = self.inner.upread();
 
+        let bio_segment = BioSegment::alloc(1, BioDirection::ToDevice);
         let start_pos = inner.start_chain.walk_to_cluster_at_offset(offset)?;
         let cluster_size = inner.fs().cluster_size();
         let mut cur_cluster = start_pos.0.clone();
         let mut cur_offset = start_pos.1;
         for _ in Bid::from_offset(offset)..Bid::from_offset(end_offset) {
-            let frame = {
-                let frame = FrameAllocOptions::new()
-                    .zeroed(false)
-                    .alloc_single(())
-                    .unwrap();
-                frame.write(0, reader)?;
-                frame
-            };
+            bio_segment.writer().unwrap().write_fallible(reader)?;
             let physical_bid =
                 Bid::from_offset(cur_cluster.cluster_id() as usize * cluster_size + cur_offset);
             let fs = inner.fs();
             fs.block_device()
-                .write_block(physical_bid, (&frame).into())?;
+                .write_blocks(physical_bid, bio_segment.clone())?;
 
             cur_offset += BLOCK_SIZE;
             if cur_offset >= cluster_size {
@@ -1518,7 +1518,7 @@ impl Inode for ExfatInode {
         if name.len() > MAX_NAME_LENGTH {
             return_errno!(Errno::ENAMETOOLONG)
         }
-        if name == "." || name == ".." {
+        if is_dot_or_dotdot(name) {
             return_errno!(Errno::EISDIR)
         }
 
@@ -1546,10 +1546,10 @@ impl Inode for ExfatInode {
         if !self.inner.read().inode_type.is_directory() {
             return_errno!(Errno::ENOTDIR)
         }
-        if name == "." {
+        if is_dot(name) {
             return_errno_with_message!(Errno::EINVAL, "rmdir on .")
         }
-        if name == ".." {
+        if is_dotdot(name) {
             return_errno_with_message!(Errno::ENOTEMPTY, "rmdir on ..")
         }
         if name.len() > MAX_NAME_LENGTH {
@@ -1602,7 +1602,7 @@ impl Inode for ExfatInode {
     }
 
     fn rename(&self, old_name: &str, target: &Arc<dyn Inode>, new_name: &str) -> Result<()> {
-        if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+        if is_dot_or_dotdot(old_name) || is_dot_or_dotdot(new_name) {
             return_errno!(Errno::EISDIR);
         }
         if old_name.len() > MAX_NAME_LENGTH || new_name.len() > MAX_NAME_LENGTH {
@@ -1687,6 +1687,8 @@ impl Inode for ExfatInode {
         let fs_guard = fs.lock();
         inner.sync_all(&fs_guard)?;
 
+        fs.block_device().sync()?;
+
         Ok(())
     }
 
@@ -1696,10 +1698,12 @@ impl Inode for ExfatInode {
         let fs_guard = fs.lock();
         inner.sync_data(&fs_guard)?;
 
+        fs.block_device().sync()?;
+
         Ok(())
     }
 
-    fn poll(&self, mask: IoEvents, _poller: Option<&mut Poller>) -> IoEvents {
+    fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
         let events = IoEvents::IN | IoEvents::OUT;
         events & mask
     }

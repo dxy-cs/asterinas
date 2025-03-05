@@ -46,7 +46,6 @@ where
     let mut bytes: [u8; CSocketAddrUnix::MAX_LEN + 1] = Pod::new_zeroed();
 
     bytes[..2].copy_from_slice(&(CSocketAddrFamily::AF_UNIX as u16).to_ne_bytes());
-    #[allow(clippy::assertions_on_constants)]
     const { assert!(CSocketAddrUnix::PATH_OFFSET == 2) };
 
     let sun_path = &mut bytes[CSocketAddrUnix::PATH_OFFSET..];

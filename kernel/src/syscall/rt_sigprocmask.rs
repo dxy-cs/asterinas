@@ -24,7 +24,7 @@ pub fn sys_rt_sigprocmask(
         mask_op, set_ptr, oldset_ptr, sigset_size
     );
     if sigset_size != 8 {
-        error!("sigset size is not equal to 8");
+        return_errno_with_message!(Errno::EINVAL, "sigset size is not equal to 8");
     }
     do_rt_sigprocmask(mask_op, set_ptr, oldset_ptr, ctx)?;
     Ok(SyscallReturn::Return(0))
@@ -39,13 +39,13 @@ fn do_rt_sigprocmask(
     let old_sig_mask_value = ctx.posix_thread.sig_mask().load(Ordering::Relaxed);
     debug!("old sig mask value: 0x{:x}", old_sig_mask_value);
     if oldset_ptr != 0 {
-        ctx.get_user_space()
+        ctx.user_space()
             .write_val(oldset_ptr, &old_sig_mask_value)?;
     }
 
     let sig_mask_ref = ctx.posix_thread.sig_mask();
     if set_ptr != 0 {
-        let mut read_mask = ctx.get_user_space().read_val::<SigMask>(set_ptr)?;
+        let mut read_mask = ctx.user_space().read_val::<SigMask>(set_ptr)?;
         match mask_op {
             MaskOp::Block => {
                 // According to man pages, "it is not possible to block SIGKILL or SIGSTOP.

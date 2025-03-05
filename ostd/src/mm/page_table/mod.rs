@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{fmt::Debug, marker::PhantomData, ops::Range};
+use core::{
+    fmt::Debug,
+    intrinsics::transmute_unchecked,
+    marker::PhantomData,
+    ops::Range,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use super::{
-    nr_subpage_per_huge, page_prop::PageProperty, page_size, Paddr, PagingConstsTrait, PagingLevel,
-    Vaddr,
+    io::PodOnce, nr_subpage_per_huge, page_prop::PageProperty, page_size, Paddr, PagingConstsTrait,
+    PagingLevel, Vaddr,
 };
 use crate::{
     arch::mm::{PageTableEntry, PagingConsts},
+    util::SameSizeAs,
     Pod,
 };
 
@@ -92,6 +99,26 @@ impl PageTable<UserMode> {
             self.root.activate();
         }
     }
+
+    /// Clear the page table.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    ///  1. No other cursors are accessing the page table.
+    ///  2. No other CPUs activates the page table.
+    pub(in crate::mm) unsafe fn clear(&self) {
+        let mut root_node = self.root.clone_shallow().lock();
+        const NR_PTES_PER_NODE: usize = nr_subpage_per_huge::<PagingConsts>();
+        for i in 0..NR_PTES_PER_NODE / 2 {
+            let root_entry = root_node.entry(i);
+            if !root_entry.is_none() {
+                let old = root_entry.replace(Child::None);
+                // Since no others are accessing the old child, dropping it is fine.
+                drop(old);
+            }
+        }
+    }
 }
 
 impl PageTable<KernelMode> {
@@ -100,16 +127,17 @@ impl PageTable<KernelMode> {
     /// This should be the only way to create the user page table, that is to
     /// duplicate the kernel page table with all the kernel mappings shared.
     pub fn create_user_page_table(&self) -> PageTable<UserMode> {
-        let root_node = self.root.clone_shallow().lock();
-        let mut new_node = PageTableNode::alloc(PagingConsts::NR_LEVELS);
+        let mut root_node = self.root.clone_shallow().lock();
+        let mut new_node =
+            PageTableNode::alloc(PagingConsts::NR_LEVELS, MapTrackingStatus::NotApplicable);
 
         // Make a shallow copy of the root node in the kernel space range.
         // The user space range is not copied.
         const NR_PTES_PER_NODE: usize = nr_subpage_per_huge::<PagingConsts>();
         for i in NR_PTES_PER_NODE / 2..NR_PTES_PER_NODE {
-            let child = root_node.child(i, /* meaningless */ true);
-            if !child.is_none() {
-                let _ = new_node.replace_child(i, child, /* meaningless */ true);
+            let root_entry = root_node.entry(i);
+            if !root_entry.is_none() {
+                let _ = new_node.entry(i).replace(root_entry.to_owned());
             }
         }
 
@@ -136,13 +164,18 @@ impl PageTable<KernelMode> {
 
         let mut root_node = self.root.clone_shallow().lock();
         for i in start..end {
-            if !root_node.read_pte(i).is_present() {
-                let node = PageTableNode::alloc(PagingConsts::NR_LEVELS - 1);
-                let _ = root_node.replace_child(
-                    i,
-                    Child::PageTable(node.into_raw()),
-                    i < NR_PTES_PER_NODE * 3 / 4,
-                );
+            let root_entry = root_node.entry(i);
+            if root_entry.is_none() {
+                let nxt_level = PagingConsts::NR_LEVELS - 1;
+                let is_tracked = if super::kspace::should_map_as_tracked(
+                    i * page_size::<PagingConsts>(nxt_level),
+                ) {
+                    MapTrackingStatus::Tracked
+                } else {
+                    MapTrackingStatus::Untracked
+                };
+                let node = PageTableNode::alloc(nxt_level, is_tracked);
+                let _ = root_entry.replace(Child::PageTable(node.into_raw()));
             }
         }
     }
@@ -175,7 +208,8 @@ where
     /// Create a new empty page table. Useful for the kernel page table and IOMMU page tables only.
     pub fn empty() -> Self {
         PageTable {
-            root: PageTableNode::<E, C>::alloc(C::NR_LEVELS).into_raw(),
+            root: PageTableNode::<E, C>::alloc(C::NR_LEVELS, MapTrackingStatus::NotApplicable)
+                .into_raw(),
             _phantom: PhantomData,
         }
     }
@@ -311,7 +345,9 @@ pub(super) unsafe fn page_walk<E: PageTableEntryTrait, C: PagingConstsTrait>(
 /// The interface for defining architecture-specific page table entries.
 ///
 /// Note that a default PTE should be a PTE that points to nothing.
-pub trait PageTableEntryTrait: Clone + Copy + Debug + Default + Pod + Sized + Sync {
+pub trait PageTableEntryTrait:
+    Clone + Copy + Debug + Default + Pod + PodOnce + SameSizeAs<usize> + Sized + Send + Sync + 'static
+{
     /// Create a set of new invalid page table flags that indicates an absent page.
     ///
     /// Note that currently the implementation requires an all zero PTE to be an absent PTE.
@@ -320,6 +356,10 @@ pub trait PageTableEntryTrait: Clone + Copy + Debug + Default + Pod + Sized + Sy
     }
 
     /// If the flags are present with valid mappings.
+    ///
+    /// For PTEs created by [`Self::new_absent`], this method should return
+    /// false. And for PTEs created by [`Self::new_page`] or [`Self::new_pt`]
+    /// and modified with [`Self::set_prop`] this method should return true.
     fn is_present(&self) -> bool;
 
     /// Create a new PTE with the given physical address and flags that map to a page.
@@ -336,6 +376,10 @@ pub trait PageTableEntryTrait: Clone + Copy + Debug + Default + Pod + Sized + Sy
 
     fn prop(&self) -> PageProperty;
 
+    /// Set the page property of the PTE.
+    ///
+    /// This will be only done if the PTE is present. If not, this method will
+    /// do nothing.
     fn set_prop(&mut self, prop: PageProperty);
 
     /// If the PTE maps a page rather than a child page table.
@@ -343,4 +387,40 @@ pub trait PageTableEntryTrait: Clone + Copy + Debug + Default + Pod + Sized + Sy
     /// The level of the page table the entry resides is given since architectures
     /// like amd64 only uses a huge bit in intermediate levels.
     fn is_last(&self, level: PagingLevel) -> bool;
+
+    /// Converts the PTE into its corresponding `usize` value.
+    fn as_usize(self) -> usize {
+        // SAFETY: `Self` is `Pod` and has the same memory representation as `usize`.
+        unsafe { transmute_unchecked(self) }
+    }
+
+    /// Converts a usize `pte_raw` into a PTE.
+    fn from_usize(pte_raw: usize) -> Self {
+        // SAFETY: `Self` is `Pod` and has the same memory representation as `usize`.
+        unsafe { transmute_unchecked(pte_raw) }
+    }
+}
+
+/// Loads a page table entry with an atomic instruction.
+///
+/// # Safety
+///
+/// The safety preconditions are same as those of [`AtomicUsize::from_ptr`].
+pub unsafe fn load_pte<E: PageTableEntryTrait>(ptr: *mut E, ordering: Ordering) -> E {
+    // SAFETY: The safety is upheld by the caller.
+    let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
+    let pte_raw = atomic.load(ordering);
+    E::from_usize(pte_raw)
+}
+
+/// Stores a page table entry with an atomic instruction.
+///
+/// # Safety
+///
+/// The safety preconditions are same as those of [`AtomicUsize::from_ptr`].
+pub unsafe fn store_pte<E: PageTableEntryTrait>(ptr: *mut E, new_val: E, ordering: Ordering) {
+    let new_raw = new_val.as_usize();
+    // SAFETY: The safety is upheld by the caller.
+    let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
+    atomic.store(new_raw, ordering)
 }

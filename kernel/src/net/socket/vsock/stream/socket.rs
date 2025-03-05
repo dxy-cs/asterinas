@@ -5,13 +5,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::{connected::Connected, connecting::Connecting, init::Init, listen::Listen};
 use crate::{
     events::IoEvents,
-    fs::{file_handle::FileLike, utils::StatusFlags},
+    fs::file_handle::FileLike,
     net::socket::{
+        private::SocketPrivate,
         vsock::{addr::VsockSocketAddr, VSOCK_GLOBAL},
         MessageHeader, SendRecvFlags, SockShutdownCmd, Socket, SocketAddr,
     },
     prelude::*,
-    process::signal::{Pollable, Poller},
+    process::signal::{PollHandle, Pollable, Poller},
     util::{MultiRead, MultiWrite},
 };
 
@@ -42,14 +43,6 @@ impl VsockStreamSocket {
         }
     }
 
-    fn is_nonblocking(&self) -> bool {
-        self.is_nonblocking.load(Ordering::Relaxed)
-    }
-
-    fn set_nonblocking(&self, nonblocking: bool) {
-        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
-    }
-
     fn try_accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
         let listen = match &*self.status.read() {
             Status::Listen(listen) => listen.clone(),
@@ -59,7 +52,6 @@ impl VsockStreamSocket {
         };
 
         let connected = listen.try_accept()?;
-        listen.update_io_events();
 
         let peer_addr = connected.peer_addr();
 
@@ -101,7 +93,6 @@ impl VsockStreamSocket {
         };
 
         let read_size = connected.try_recv(writer)?;
-        connected.update_io_events();
 
         let peer_addr = self.peer_addr()?;
         // If buffer is now empty and the peer requested shutdown, finish shutting down the
@@ -113,22 +104,10 @@ impl VsockStreamSocket {
         }
         Ok((read_size, peer_addr))
     }
-
-    fn recv(
-        &self,
-        writer: &mut dyn MultiWrite,
-        flags: SendRecvFlags,
-    ) -> Result<(usize, SocketAddr)> {
-        if self.is_nonblocking() {
-            self.try_recv(writer, flags)
-        } else {
-            self.wait_events(IoEvents::IN, || self.try_recv(writer, flags))
-        }
-    }
 }
 
 impl Pollable for VsockStreamSocket {
-    fn poll(&self, mask: IoEvents, poller: Option<&mut Poller>) -> IoEvents {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
         match &*self.status.read() {
             Status::Init(init) => init.poll(mask, poller),
             Status::Listen(listen) => listen.poll(mask, poller),
@@ -137,39 +116,13 @@ impl Pollable for VsockStreamSocket {
     }
 }
 
-impl FileLike for VsockStreamSocket {
-    fn as_socket(self: Arc<Self>) -> Option<Arc<dyn Socket>> {
-        Some(self)
+impl SocketPrivate for VsockStreamSocket {
+    fn is_nonblocking(&self) -> bool {
+        self.is_nonblocking.load(Ordering::Relaxed)
     }
 
-    fn read(&self, writer: &mut VmWriter) -> Result<usize> {
-        // TODO: Set correct flags
-        let read_len = self
-            .recv(writer, SendRecvFlags::empty())
-            .map(|(len, _)| len)?;
-        Ok(read_len)
-    }
-
-    fn write(&self, reader: &mut VmReader) -> Result<usize> {
-        // TODO: Set correct flags
-        self.send(reader, SendRecvFlags::empty())
-    }
-
-    fn status_flags(&self) -> StatusFlags {
-        if self.is_nonblocking() {
-            StatusFlags::O_NONBLOCK
-        } else {
-            StatusFlags::empty()
-        }
-    }
-
-    fn set_status_flags(&self, new_flags: StatusFlags) -> Result<()> {
-        if new_flags.contains(StatusFlags::O_NONBLOCK) {
-            self.set_nonblocking(true);
-        } else {
-            self.set_nonblocking(false);
-        }
-        Ok(())
+    fn set_nonblocking(&self, nonblocking: bool) {
+        self.is_nonblocking.store(nonblocking, Ordering::Relaxed);
     }
 }
 
@@ -218,9 +171,9 @@ impl Socket for VsockStreamSocket {
         vsockspace.request(&connecting.info()).unwrap();
         // wait for response from driver
         // TODO: Add timeout
-        let mut poller = Poller::new();
+        let mut poller = Poller::new(None);
         if !connecting
-            .poll(IoEvents::IN, Some(&mut poller))
+            .poll(IoEvents::IN, Some(poller.as_handle_mut()))
             .contains(IoEvents::IN)
         {
             if let Err(e) = poller.wait() {
@@ -269,11 +222,7 @@ impl Socket for VsockStreamSocket {
     }
 
     fn accept(&self) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
-        if self.is_nonblocking() {
-            self.try_accept()
-        } else {
-            self.wait_events(IoEvents::IN, || self.try_accept())
-        }
+        self.block_on(IoEvents::IN, || self.try_accept())
     }
 
     fn shutdown(&self, cmd: SockShutdownCmd) -> Result<()> {
@@ -292,7 +241,9 @@ impl Socket for VsockStreamSocket {
         flags: SendRecvFlags,
     ) -> Result<usize> {
         // TODO: Deal with flags
-        debug_assert!(flags.is_all_supported());
+        if !flags.is_all_supported() {
+            warn!("unsupported flags: {:?}", flags);
+        }
 
         let MessageHeader {
             control_message, ..
@@ -312,9 +263,11 @@ impl Socket for VsockStreamSocket {
         flags: SendRecvFlags,
     ) -> Result<(usize, MessageHeader)> {
         // TODO: Deal with flags
-        debug_assert!(flags.is_all_supported());
+        if !flags.is_all_supported() {
+            warn!("unsupported flags: {:?}", flags);
+        }
 
-        let (received_bytes, _) = self.recv(writer, flags)?;
+        let (received_bytes, _) = self.block_on(IoEvents::IN, || self.try_recv(writer, flags))?;
 
         // TODO: Receive control message
 
@@ -350,8 +303,8 @@ impl Socket for VsockStreamSocket {
 impl Drop for VsockStreamSocket {
     fn drop(&mut self) {
         let vsockspace = VSOCK_GLOBAL.get().unwrap();
-        let inner = self.status.read();
-        match &*inner {
+        let inner = self.status.get_mut();
+        match inner {
             Status::Init(init) => {
                 if let Some(addr) = init.bound_addr() {
                     vsockspace.recycle_port(&addr.port);
