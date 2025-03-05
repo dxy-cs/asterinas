@@ -23,6 +23,7 @@ TEST_APPS := \
 	file_io \
 	fork \
 	fork_c \
+	getcpu \
 	getpid \
 	hello_c \
 	hello_pie \
@@ -33,6 +34,7 @@ TEST_APPS := \
 	network \
 	page_cache \
 	pipe \
+	prctl \
 	pthread \
 	pty \
 	shm \
