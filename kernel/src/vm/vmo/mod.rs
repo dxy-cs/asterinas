@@ -348,7 +348,7 @@ impl Vmo_ {
         if let Some(pager) = &self.pager {
             let page_idx_range = get_page_idx_range(&read_range);
             for page_idx in page_idx_range {
-                pager.lru_promotion(page_idx)?;
+                pager.lru_promote(page_idx)?;
             }
         }
         Ok(())
@@ -391,7 +391,7 @@ impl Vmo_ {
             let page_idx_range = get_page_idx_range(&write_range);
             for page_idx in page_idx_range {
                 pager.update_page(page_idx)?;
-                pager.lru_promotion(page_idx)?;
+                pager.lru_promote(page_idx)?;
             }
         }
         Ok(())

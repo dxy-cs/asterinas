@@ -55,4 +55,10 @@ pub trait Pager: Send + Sync {
     /// Notify the pager that the frame will be fully overwritten soon, so pager can
     /// choose not to initialize it.
     fn commit_overwrite(&self, idx: usize) -> Result<UFrame>;
+
+    /// Optional callback after read or write operations to promote pages in LRU cache.
+    /// Default implementation does nothing.
+    fn lru_promote(&self, idx: usize) -> Result<()> {
+        Ok(())
+    }
 }

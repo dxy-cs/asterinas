@@ -212,16 +212,10 @@ impl VmMapping {
                     page_flags |= PageFlags::DIRTY;
                 }
                 let map_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
-                match (frame.dyn_meta() as &dyn Any).downcast_ref::<CachePageMeta>() {
-                    Some(meta) => {
-                        meta.is_mmapped.store(true, Ordering::Relaxed);
-                        cursor.map(frame, map_prop);
-                    }
-                    None => {
-                        cursor.map(frame, map_prop);
-                    }
+                if let Some(meta) = (frame.dyn_meta() as &dyn Any).downcast_ref::<CachePageMeta>() {
+                    meta.is_mmapped.store(true, Ordering::Relaxed);
                 }
-                //cursor.map(frame, map_prop);
+                cursor.map(frame, map_prop);
             }
         }
         Ok(())
@@ -283,15 +277,10 @@ impl VmMapping {
                 let page_flags = PageFlags::from(vm_perms) | PageFlags::ACCESSED;
                 let page_prop = PageProperty::new(page_flags, CachePolicy::Writeback);
                 let frame = commit_fn()?;
-                match (frame.dyn_meta() as &dyn Any).downcast_ref::<CachePageMeta>() {
-                    Some(meta) => {
-                        meta.is_mmapped.store(true, Ordering::Relaxed);
-                        cursor.map(frame, page_prop);
-                    }
-                    None => {
-                        cursor.map(frame, page_prop);
-                    }
+                if let Some(meta) = (frame.dyn_meta() as &dyn Any).downcast_ref::<CachePageMeta>() {
+                    meta.is_mmapped.store(true, Ordering::Relaxed);
                 }
+                cursor.map(frame, page_prop);
             } else {
                 let next_addr = cursor.virt_addr() + PAGE_SIZE;
                 if next_addr < end_addr {
